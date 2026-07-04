@@ -41,24 +41,49 @@ Todas as fontes vêm da plataforma [Base dos Dados](https://basedosdados.org/), 
 | Meta Alfabetização Município | `..._meta_alfabetizacao_municipio.csv` | ~10,7k linhas |
 | Avaliação Alfabetização UF | `br_inep_avaliacao_alfabetizacao_uf.csv` | 145 linhas |
 | Avaliação Alfabetização Município | `br_inep_avaliacao_alfabetizacao_municipio.csv` | ~24k linhas |
-| Dimensão UF/Município (IBGE, complementar) | a definir na Bronze | referência |
+| Dimensão UF/Município (IBGE, complementar) | API IBGE `localidades/municipios` | 5.571 municípios |
 
 ## Arquitetura da solução
 
-*(Diagrama e fluxo de dados completos serão adicionados ao final do desenvolvimento, no incremento de documentação final.)*
+*(Diagrama completo do fluxo de dados será adicionado ao final do desenvolvimento, no incremento de documentação final.)*
 
 Visão geral adotada:
 
-- **Cloud**: Google Cloud Platform.
-- **Data Lake**: Google Cloud Storage (zona raw, particionada por camada/fonte/data).
-- **Data Warehouse / Lakehouse analítico**: BigQuery, com datasets separados `bronze`, `silver`, `gold` — particionamento por `ano` e clusterização por `sigla_uf`/`id_municipio` nas camadas Silver/Gold.
-- **Ingestão batch**: scripts Python (`google-cloud-storage` + `google-cloud-bigquery`) para as fontes de metas/resultados agregados, orquestrados por Cloud Scheduler + Cloud Functions (sem cluster always-on).
-- **Ingestão streaming (simulada)**: Pub/Sub — um produtor replaya os microdados de alunos como eventos quase em tempo real; um consumidor grava micro-lotes na Bronze.
+- **Cloud**: Google Cloud Platform (projeto dedicado `tech-challenge-alfabetiza-25`, região `southamerica-east1`).
+- **Data Lake**: Google Cloud Storage (bucket `tech-challenge-alfabetiza-25-raw`, prefixo `bronze/<tabela>/<arquivo>`).
+- **Data Warehouse / Lakehouse analítico**: BigQuery, com datasets separados `bronze`, `silver`, `gold` — particionamento por `ano` e clusterização por `sigla_uf`/`id_municipio` planejados a partir da camada Silver.
+- **Ingestão batch** ([`src/bronze/batch_ingest.py`](src/bronze/batch_ingest.py)): sobe os 5 CSVs de metas/resultados agregados + a dimensão IBGE para o GCS, depois carrega cada um em uma tabela de staging no BigQuery (schema autodetectado) e materializa a tabela Bronze final via `CREATE OR REPLACE TABLE ... AS SELECT` acrescentando `_ingested_at`/`_source_file`.
+- **Ingestão streaming (simulada)** ([`src/streaming/producer.py`](src/streaming/producer.py) + [`src/streaming/consumer.py`](src/streaming/consumer.py)): um produtor replaya linhas do CSV de microdados de alunos como mensagens Pub/Sub, a uma taxa controlada; um consumidor faz *pull* das mensagens, acumula micro-lotes e grava via streaming insert na tabela `bronze.dados_alunos_streaming`.
+- **Dimensão de referência** ([`src/bronze/ibge_reference.py`](src/bronze/ibge_reference.py)): busca nome de UF/município/região na API pública do IBGE, já que nenhuma fonte do INEP traz esses atributos — apenas códigos.
+- **Provisionamento de infraestrutura** ([`src/bronze/setup_infra.py`](src/bronze/setup_infra.py)): script idempotente que cria bucket, datasets e tópico/assinatura Pub/Sub via `google-cloud-*` (sem Terraform, dado o tamanho do projeto).
 - **Camadas**: Bronze (dados brutos, sem transformação) → Silver (limpeza, padronização, normalização de chaves, integração/dimensões, validação de qualidade) → Gold (marts analíticos prontos para BI/ML).
+
+### Bronze — o que já está implementado e validado
+
+Rodado contra o projeto GCP real:
+
+| Tabela Bronze | Linhas carregadas |
+|---|---|
+| `meta_alfabetizacao_brasil` | 3 |
+| `meta_alfabetizacao_uf` | 54 |
+| `meta_alfabetizacao_municipio` | 10.704 |
+| `avaliacao_alfabetizacao_uf` | 145 |
+| `avaliacao_alfabetizacao_municipio` | 23.995 |
+| `ibge_municipios` | 5.571 |
+| `dados_alunos_streaming` (via Pub/Sub, amostra de teste) | 1.126 eventos (190 alunos distintos) |
+
+**Achado relevante**: na simulação streaming, o número de linhas gravadas superou o de alunos distintos publicados — o Pub/Sub garante *at-least-once delivery*, então mensagens podem ser reentregues e gravadas mais de uma vez. Isso é esperado e **correto** para a Bronze (que preserva os dados brutos exatamente como chegaram, duplicados inclusive); a deduplicação é responsabilidade da camada Silver.
 
 ## Tecnologias e justificativa
 
-*(Seção detalhada nos próximos incrementos, à medida que cada componente é implementado.)*
+| Componente | Escolha | Por quê |
+|---|---|---|
+| Cloud | **GCP** | Serverless-first (BigQuery separa storage/compute, Cloud Functions escalam a zero); "Base dos Dados" (fonte original) é nativa de BigQuery, o que facilitaria ingestão direta em uma evolução futura. |
+| Data lake | Google Cloud Storage | Object storage simples, barato, integra nativamente com BigQuery (`LOAD ... FROM URI`). |
+| Warehouse/Lakehouse | BigQuery | Serverless, particionamento/clusterização nativos, cobrança separada de storage e compute — chave para o FinOps do projeto. |
+| Streaming | Pub/Sub | Serviço gerenciado equivalente ao Kafka visto no curso, sem operar cluster; adequado ao volume de simulação do desafio. |
+| Orquestração batch | Cloud Scheduler + Cloud Functions *(a implementar)* | Evita o custo de um cluster Airflow/Composer sempre ativo para uma pipeline deste porte — decisão de FinOps documentada em `docs/finops.md` (incremento futuro). |
+| Linguagem | Python (`google-cloud-storage`, `google-cloud-bigquery`, `google-cloud-pubsub`) | Alinhado ao que foi usado nos hands-on do curso (Pandas/PySpark, clientes Python de nuvem). |
 
 ## Decisões arquiteturais e trade-offs
 
@@ -83,6 +108,27 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # preencha com os dados do seu projeto GCP
+
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project <SEU_PROJECT_ID>
 ```
 
-Instruções detalhadas de execução de cada camada serão adicionadas junto com o respectivo incremento (Bronze, Silver, Gold).
+### Camada Bronze
+
+```bash
+# Provisiona bucket, datasets e tópico/assinatura Pub/Sub (idempotente)
+PYTHONPATH=src python -m bronze.setup_infra
+
+# Busca a dimensão de referência UF/Município na API do IBGE
+PYTHONPATH=src python -m bronze.ibge_reference
+
+# Ingestão batch: sobe e carrega os 5 CSVs de metas/resultados + a dimensão IBGE
+PYTHONPATH=src python -m bronze.batch_ingest
+
+# Ingestão streaming (simulação): rodar em dois terminais
+PYTHONPATH=src python -m streaming.consumer --max-messages 500 --window-seconds 120
+PYTHONPATH=src python -m streaming.producer --limit 500 --rate 20
+```
+
+Instruções detalhadas de execução das próximas camadas (Silver, Gold) serão adicionadas junto com o respectivo incremento.
