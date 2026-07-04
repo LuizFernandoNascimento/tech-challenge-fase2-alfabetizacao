@@ -1,0 +1,21 @@
+# Dados brutos completos (ficam no data lake/GCS, não no git)
+data/raw/
+
+# Credenciais e variáveis de ambiente
+.env
+*-key.json
+*credentials*.json
+service-account*.json
+credentials/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# SO / editores
+.DS_Store
+.vscode/
+.idea/
