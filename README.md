@@ -74,6 +74,23 @@ Rodado contra o projeto GCP real:
 
 **Achado relevante**: na simulação streaming, o número de linhas gravadas superou o de alunos distintos publicados — o Pub/Sub garante *at-least-once delivery*, então mensagens podem ser reentregues e gravadas mais de uma vez. Isso é esperado e **correto** para a Bronze (que preserva os dados brutos exatamente como chegaram, duplicados inclusive); a deduplicação é responsabilidade da camada Silver.
 
+### Bronze — deployado como Cloud Functions (Gen2)
+
+A ingestão batch e o consumidor streaming, que antes só existiam como scripts rodados manualmente no terminal, agora também rodam **dentro do GCP** como Cloud Functions Gen2 — o que significa que o código fica visível e executável no console, sem depender de uma máquina local.
+
+| Recurso | Nome | Tipo de acionamento | Estado |
+|---|---|---|---|
+| Cloud Function | `bronze-batch-ingest` | HTTP (chamado pelo Cloud Scheduler) | `ACTIVE` |
+| Cloud Function | `bronze-streaming-consumer` | Pub/Sub (`dados-alunos-stream`), uma invocação por mensagem | `ACTIVE` |
+| Cloud Scheduler | `bronze-batch-schedule` | Cron diário `0 6 * * *` (America/Sao_Paulo) | **`PAUSED`** — criado só para fins de demonstração/estudo, deliberadamente nunca disparado, para não gerar custo/execuções não desejadas |
+
+**Onde ver isso no console** (login com a conta do projeto):
+- Cloud Functions (código-fonte inline, aba "Source"): https://console.cloud.google.com/functions/list?project=tech-challenge-alfabetiza-25
+- Cloud Scheduler (confirma o job `PAUSED`): https://console.cloud.google.com/cloudscheduler?project=tech-challenge-alfabetiza-25
+- Logs de execução: https://console.cloud.google.com/logs/query?project=tech-challenge-alfabetiza-25
+
+**Detalhe de implementação**: ambas as funções compartilham um único `src/main.py` (convenção do Cloud Functions Gen2 — um arquivo, várias funções selecionadas por `--entry-point` no deploy). A função batch relê arquivos já existentes no GCS (não faz upload — não há disco local na nuvem); a função streaming processa **uma mensagem por invocação** (sem buffer local, diferente do micro-lote do consumidor manual), o que é a essência de uma função stateless acionada por evento.
+
 ## Tecnologias e justificativa
 
 | Componente | Escolha | Por quê |
@@ -82,7 +99,7 @@ Rodado contra o projeto GCP real:
 | Data lake | Google Cloud Storage | Object storage simples, barato, integra nativamente com BigQuery (`LOAD ... FROM URI`). |
 | Warehouse/Lakehouse | BigQuery | Serverless, particionamento/clusterização nativos, cobrança separada de storage e compute — chave para o FinOps do projeto. |
 | Streaming | Pub/Sub | Serviço gerenciado equivalente ao Kafka visto no curso, sem operar cluster; adequado ao volume de simulação do desafio. |
-| Orquestração batch | Cloud Scheduler + Cloud Functions *(a implementar)* | Evita o custo de um cluster Airflow/Composer sempre ativo para uma pipeline deste porte — decisão de FinOps documentada em `docs/finops.md` (incremento futuro). |
+| Orquestração batch | Cloud Scheduler + Cloud Functions | Evita o custo de um cluster Airflow/Composer sempre ativo para uma pipeline deste porte — decisão de FinOps documentada em `docs/finops.md` (incremento futuro). Deployado (ver seção acima), mas o Scheduler é mantido `PAUSED` deliberadamente. |
 | Linguagem | Python (`google-cloud-storage`, `google-cloud-bigquery`, `google-cloud-pubsub`) | Alinhado ao que foi usado nos hands-on do curso (Pandas/PySpark, clientes Python de nuvem). |
 
 ## Decisões arquiteturais e trade-offs
@@ -129,6 +146,31 @@ PYTHONPATH=src python -m bronze.batch_ingest
 # Ingestão streaming (simulação): rodar em dois terminais
 PYTHONPATH=src python -m streaming.consumer --max-messages 500 --window-seconds 120
 PYTHONPATH=src python -m streaming.producer --limit 500 --rate 20
+```
+
+### Deploy das Cloud Functions (Bronze)
+
+```bash
+# Função batch (HTTP, chamada pelo Cloud Scheduler)
+gcloud functions deploy bronze-batch-ingest \
+  --gen2 --region=southamerica-east1 --runtime=python312 \
+  --source=src --entry-point=batch_ingest_http --trigger-http --no-allow-unauthenticated \
+  --memory=512Mi --timeout=300s \
+  --set-env-vars=GCP_PROJECT_ID=<PROJECT_ID>,GCS_BUCKET_RAW=<BUCKET>,BQ_DATASET_BRONZE=bronze
+
+# Função streaming (acionada por mensagem no Pub/Sub)
+gcloud functions deploy bronze-streaming-consumer \
+  --gen2 --region=southamerica-east1 --runtime=python312 \
+  --source=src --entry-point=streaming_consumer_pubsub --trigger-topic=dados-alunos-stream \
+  --memory=256Mi --timeout=60s \
+  --set-env-vars=GCP_PROJECT_ID=<PROJECT_ID>,BQ_DATASET_BRONZE=bronze
+
+# Cloud Scheduler apontando para a função batch - criado e IMEDIATAMENTE pausado
+gcloud scheduler jobs create http bronze-batch-schedule \
+  --location=southamerica-east1 --schedule="0 6 * * *" \
+  --uri="<URL_DA_FUNCAO_BATCH>" --http-method=POST \
+  --oidc-service-account-email=<SERVICE_ACCOUNT> --oidc-token-audience="<URL_DA_FUNCAO_BATCH>"
+gcloud scheduler jobs pause bronze-batch-schedule --location=southamerica-east1
 ```
 
 Instruções detalhadas de execução das próximas camadas (Silver, Gold) serão adicionadas junto com o respectivo incremento.
