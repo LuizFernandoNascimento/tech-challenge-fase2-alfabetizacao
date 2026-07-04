@@ -1,0 +1,8 @@
+# Dependências mínimas para o deploy das Cloud Functions (Gen2) da
+# Bronze - deliberadamente sem pandas/pyarrow/requests (usados só em
+# dev local) para manter o pacote implantado enxuto.
+functions-framework>=3.5
+google-cloud-bigquery>=3.20
+google-cloud-storage>=2.16
+google-cloud-pubsub>=2.21
+python-dotenv>=1.0

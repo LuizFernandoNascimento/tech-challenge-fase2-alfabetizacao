@@ -2,7 +2,6 @@
 micro-lotes e grava na tabela Bronze de streaming no BigQuery.
 """
 import argparse
-import datetime as dt
 import json
 import logging
 import time
@@ -10,53 +9,10 @@ import time
 from google.cloud import bigquery, pubsub_v1
 
 from bronze.config import load_settings
-from bronze.sources import STREAMING_SOURCE
+from bronze.streaming_schema import coerce_row, ensure_streaming_table
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-SCHEMA = [
-    bigquery.SchemaField("ano", "INTEGER"),
-    bigquery.SchemaField("id_municipio", "STRING"),
-    bigquery.SchemaField("id_escola", "STRING"),
-    bigquery.SchemaField("id_aluno", "STRING"),
-    bigquery.SchemaField("caderno", "INTEGER"),
-    bigquery.SchemaField("serie", "INTEGER"),
-    bigquery.SchemaField("rede", "INTEGER"),
-    bigquery.SchemaField("presenca", "INTEGER"),
-    bigquery.SchemaField("preenchimento_caderno", "INTEGER"),
-    bigquery.SchemaField("alfabetizado", "INTEGER"),
-    bigquery.SchemaField("proficiencia", "FLOAT"),
-    bigquery.SchemaField("peso_aluno", "FLOAT"),
-    bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
-    bigquery.SchemaField("_source_file", "STRING"),
-]
-
-INT_FIELDS = {"ano", "caderno", "serie", "rede", "presenca", "preenchimento_caderno", "alfabetizado"}
-FLOAT_FIELDS = {"proficiencia", "peso_aluno"}
-
-
-def ensure_streaming_table(bq_client: bigquery.Client, dataset_id: str) -> str:
-    table_id = f"{bq_client.project}.{dataset_id}.{STREAMING_SOURCE.table_name}"
-    table = bigquery.Table(table_id, schema=SCHEMA)
-    bq_client.create_table(table, exists_ok=True)
-    return table_id
-
-
-def _coerce(row: dict) -> dict:
-    # Bronze normalmente não transforma, mas tipagem mínima é necessária
-    # aqui porque a inserção streaming (ao contrário do LoadJob) não
-    # faz autodetecção de schema a partir de texto.
-    coerced = dict(row)
-    for field in INT_FIELDS:
-        value = coerced.get(field)
-        coerced[field] = int(value) if value not in (None, "") else None
-    for field in FLOAT_FIELDS:
-        value = coerced.get(field)
-        coerced[field] = float(value) if value not in (None, "") else None
-    coerced["_ingested_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    coerced["_source_file"] = STREAMING_SOURCE.file_name
-    return coerced
 
 
 def run(max_messages: int, batch_window_seconds: float) -> None:
@@ -86,7 +42,7 @@ def run(max_messages: int, batch_window_seconds: float) -> None:
 
     def callback(message):
         row = json.loads(message.data.decode("utf-8"))
-        buffer.append(_coerce(row))
+        buffer.append(coerce_row(row))
         message.ack()
         if len(buffer) >= 100:
             flush()

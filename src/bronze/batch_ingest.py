@@ -57,7 +57,17 @@ def load_to_bigquery(bq_client: bigquery.Client, dataset_id: str, gcs_uri: str, 
     logger.info("Bronze carregada: %s (%d linhas)", final_table_id, table.num_rows)
 
 
+def _gcs_uri(bucket_name: str, source: BronzeSource) -> str:
+    return f"gs://{bucket_name}/bronze/{source.table_name}/{source.file_name}"
+
+
 def run() -> None:
+    """Bootstrap local: sobe os CSVs para o GCS e carrega no BigQuery.
+
+    Usado apenas em desenvolvimento local, onde os arquivos brutos
+    existem em disco. Não é o que a Cloud Function deployada roda -
+    ver reload_bronze_from_gcs().
+    """
     settings = load_settings()
     storage_client = storage.Client(project=settings.project_id)
     bq_client = bigquery.Client(project=settings.project_id)
@@ -65,6 +75,23 @@ def run() -> None:
     sources = [*BATCH_SOURCES, IBGE_REFERENCE_SOURCE]
     for source in sources:
         gcs_uri = upload_to_gcs(storage_client, settings.bucket_raw, source)
+        load_to_bigquery(bq_client, settings.dataset_bronze, gcs_uri, source)
+
+
+def reload_bronze_from_gcs() -> None:
+    """Recarrega a Bronze a partir dos arquivos já existentes no GCS.
+
+    É isto que a Cloud Function batch (acionada pelo Cloud Scheduler)
+    executa: não há disco local na nuvem, então ela não faz upload -
+    apenas relê os arquivos que o processo de origem já deixou no
+    bucket raw (aqui, os mesmos publicados pelo bootstrap local).
+    """
+    settings = load_settings()
+    bq_client = bigquery.Client(project=settings.project_id)
+
+    sources = [*BATCH_SOURCES, IBGE_REFERENCE_SOURCE]
+    for source in sources:
+        gcs_uri = _gcs_uri(settings.bucket_raw, source)
         load_to_bigquery(bq_client, settings.dataset_bronze, gcs_uri, source)
 
 

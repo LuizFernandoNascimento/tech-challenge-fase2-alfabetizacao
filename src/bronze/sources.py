@@ -4,11 +4,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Pasta com os CSVs originais (fora do repositório, ver docs/data_dictionary.md).
+# Só é usada no bootstrap local (bronze/batch_ingest.py::run); nas
+# Cloud Functions deployadas não existe disco local nem essa
+# profundidade de diretórios, então o cálculo é best-effort.
 # Pode ser sobrescrita por RAW_DATA_DIR para rodar contra data/sample/ em dev.
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-RAW_DATA_DIR = Path(
-    os.environ.get("RAW_DATA_DIR", _REPO_ROOT / "tech challenge" / "base de dados")
-)
+def _default_raw_data_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parents[3] / "tech challenge" / "base de dados"
+    except IndexError:
+        return Path("data/sample")
+
+
+RAW_DATA_DIR = Path(os.environ.get("RAW_DATA_DIR", _default_raw_data_dir()))
 
 
 @dataclass(frozen=True)
