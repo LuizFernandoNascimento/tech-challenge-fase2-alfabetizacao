@@ -2,9 +2,9 @@
 
 Fonte: [Base dos Dados](https://basedosdados.org/) — indicador **Criança Alfabetizada** (INEP / Compromisso Nacional Criança Alfabetizada), Pesquisa Alfabetiza Brasil (2023).
 
-Todos os arquivos originais estão em [`../../tech challenge/base de dados`](../../tech%20challenge/base%20de%20dados) (não versionados neste repositório por tamanho — ver `data/sample/` para amostras de ~2.000 linhas usadas em desenvolvimento local).
+**Atualização**: a ingestão batch passou a ler as 5 tabelas de metas/resultados + os microdados de aluno direto das tabelas BigQuery públicas da Base dos Dados (`basedosdados.br_inep_avaliacao_alfabetizacao.*`), em vez dos CSVs baixados localmente. Os CSVs originais continuam em [`../../tech challenge/base de dados`](../../tech%20challenge/base%20de%20dados) (não versionados neste repositório por tamanho) e as amostras em `data/sample/` — úteis como referência de schema e para desenvolvimento offline, mas não são mais o caminho usado pelo pipeline em produção.
 
-## 1. `dados_alunos` (origem: `Dados de alunos.csv`)
+## 1. `dados_alunos` (origem: `basedosdados.br_inep_avaliacao_alfabetizacao.alunos`)
 
 Microdados de aluno — granularidade mais fina, usada como fonte da **ingestão streaming** (simula chegada de resultados de avaliação individual quase em tempo real). ~3,87 milhões de linhas / 214 MB.
 

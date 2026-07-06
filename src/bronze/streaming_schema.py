@@ -6,7 +6,9 @@ import datetime as dt
 
 from google.cloud import bigquery
 
-from bronze.sources import STREAMING_SOURCE
+from bronze.sources import BASEDOSDADOS_DATASET, BASEDOSDADOS_PROJECT, STREAMING_SOURCE
+
+_SOURCE_TABLE = f"{BASEDOSDADOS_PROJECT}.{BASEDOSDADOS_DATASET}.{STREAMING_SOURCE.bd_table}"
 
 SCHEMA = [
     bigquery.SchemaField("ano", "INTEGER"),
@@ -48,5 +50,5 @@ def coerce_row(row: dict) -> dict:
         value = coerced.get(field)
         coerced[field] = float(value) if value not in (None, "") else None
     coerced["_ingested_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    coerced["_source_file"] = STREAMING_SOURCE.file_name
+    coerced["_source_file"] = _SOURCE_TABLE
     return coerced
