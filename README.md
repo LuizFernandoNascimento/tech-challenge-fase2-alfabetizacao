@@ -91,6 +91,23 @@ A ingestão batch e o consumidor streaming, que antes só existiam como scripts 
 
 **Detalhe de implementação**: ambas as funções compartilham um único `src/main.py` (convenção do Cloud Functions Gen2 — um arquivo, várias funções selecionadas por `--entry-point` no deploy). A função batch relê arquivos já existentes no GCS (não faz upload — não há disco local na nuvem); a função streaming processa **uma mensagem por invocação** (sem buffer local, diferente do micro-lote do consumidor manual), o que é a essência de uma função stateless acionada por evento.
 
+### Silver — Processamento, Deduplicação e Enriquecimento
+
+A camada Silver consome as tabelas brutas da camada Bronze e realiza transformações estruturais diretamente no BigQuery (FinOps), garantindo dados limpos, tipados e integrados:
+
+- **Deduplicação de Eventos**: Deduplica os dados de `dados_alunos_streaming` selecionando o registro mais recente por `id_aluno` e `ano` (com base no metadado `_ingested_at`), contornando a reentrega do Pub/Sub.
+- **Padronização**: Padroniza os códigos de municípios (`id_municipio`) preenchendo-os com zeros à esquerda (7 dígitos) e mapeia os inteiros da rede de ensino (`rede`) para seus rótulos textuais equivalentes (`Federal`, `Estadual`, `Municipal`, `Privada`).
+- **Enriquecimento e Resolução de Lacunas**: Realiza `LEFT JOIN` com `dim_localidades` (gerada a partir de `ibge_municipios`) para incluir a informação de `sigla_uf` nas tabelas municipais de metas e avaliações que originalmente possuíam apenas o código do município.
+- **Performance e FinOps**: Aplica particionamento físico por `ano` (usando `RANGE_BUCKET`) e clusterização pelas colunas de consulta frequente `sigla_uf` e `id_municipio`.
+
+### Silver — deployado como Cloud Functions (Gen2)
+
+A transformação e validação da camada Silver também foram integradas ao `src/main.py` como um endpoint HTTP (`silver_transform_http`), permitindo que a camada seja acionada na nuvem como uma Cloud Function Gen2 de forma totalmente serverless.
+
+| Recurso | Nome | Tipo de acionamento | Estado |
+|---|---|---|---|
+| Cloud Function | `silver-transform` | HTTP (chamada via webhook ou Scheduler) | `ACTIVE` |
+
 ## Tecnologias e justificativa
 
 | Componente | Escolha | Por quê |
@@ -108,7 +125,12 @@ A ingestão batch e o consumidor streaming, que antes só existiam como scripts 
 
 ## Qualidade de dados
 
-*(Seção futura — regras de duplicidade, nulos, integridade referencial e consistência entre tabelas, implementadas na camada Silver.)*
+A camada Silver inclui um pipeline de qualidade de dados (`src/quality/data_quality.py`) que valida a consistência de todas as tabelas após o processamento no BigQuery:
+
+- **Unicidade de Chaves**: Valida chaves primárias únicas (`id_municipio` em `dim_localidades`, `id_aluno + ano` em `dados_alunos_streaming`, `ano + sigla_uf + rede` em `meta_alfabetizacao_uf`).
+- **Valores Nulos**: Garante a ausência de nulos em chaves primárias e colunas de agregação obrigatórias.
+- **Integridade Referencial**: Alerta se houver IDs de municípios nas tabelas transacionais/metas que não existam na dimensão `dim_localidades`.
+- **Sanidade de Domínio**: Confirma que campos como `presenca` e `alfabetizado` contêm estritamente `0` ou `1`.
 
 ## Monitoramento e FinOps
 
@@ -148,6 +170,13 @@ PYTHONPATH=src python -m streaming.consumer --max-messages 500 --window-seconds 
 PYTHONPATH=src python -m streaming.producer --limit 500 --rate 20
 ```
 
+### Camada Silver
+
+```bash
+# Executa transformações e validações de qualidade localmente
+PYTHONPATH=src .venv/bin/python3 -m silver.run_silver
+```
+
 ### Deploy das Cloud Functions (Bronze)
 
 ```bash
@@ -173,4 +202,15 @@ gcloud scheduler jobs create http bronze-batch-schedule \
 gcloud scheduler jobs pause bronze-batch-schedule --location=southamerica-east1
 ```
 
-Instruções detalhadas de execução das próximas camadas (Silver, Gold) serão adicionadas junto com o respectivo incremento.
+### Deploy das Cloud Functions (Silver)
+
+```bash
+# Função Silver (HTTP, aciona processamento e testes de qualidade)
+gcloud functions deploy silver-transform \
+  --gen2 --region=southamerica-east1 --runtime=python312 \
+  --source=src --entry-point=silver_transform_http --trigger-http --no-allow-unauthenticated \
+  --memory=512Mi --timeout=300s \
+  --set-env-vars=GCP_PROJECT_ID=<PROJECT_ID>,BQ_DATASET_BRONZE=bronze,BQ_DATASET_SILVER=silver
+```
+
+Instruções detalhadas de execução das próximas camadas (Gold) serão adicionadas junto com o respectivo incremento.
