@@ -1,6 +1,22 @@
 """Executa as transformações SQL para construir a Camada Silver a partir da Bronze.
 
 Todas as transformações rodam diretamente no BigQuery para máxima eficiência de custo/tempo (FinOps).
+
+Duas coisas importantes que mudaram depois da primeira versão:
+
+1. A Bronze agora é append-only (cada execução da ingestão batch
+   guarda um novo snapshot, para preservar histórico completo - ver
+   bronze/batch_ingest.py). Isso significa que a Silver não pode mais
+   fazer um `SELECT * FROM bronze.X` direto: precisa filtrar
+   explicitamente o snapshot mais recente (`_ingested_at` máximo).
+   A tabela de streaming (`dados_alunos_streaming`) é exceção: lá,
+   cada linha já é um evento individual, não um snapshot completo, e
+   a deduplicação por `id_aluno`/`ano` continua cuidando disso.
+2. Registros sem correspondência em `dim_localidades` não são mais
+   mascarados com `sigla_uf = 'ND'`. Eles são roteados para tabelas de
+   quarentena (`silver.quarentena_*`), com o motivo da rejeição - a
+   tabela Silver "de verdade" só contém registros com integridade
+   referencial garantida por construção (INNER JOIN).
 """
 import logging
 from google.cloud import bigquery
@@ -10,13 +26,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+def _latest_snapshot(project: str, bronze: str, table: str) -> str:
+    """Fragmento SQL que filtra apenas o snapshot mais recente de uma
+    tabela Bronze append-only (a Bronze pode ter vários `_ingested_at`
+    acumulados; a Silver só quer o estado mais atual)."""
+    fq_table = f"`{project}.{bronze}.{table}`"
+    return f"""(
+        SELECT * FROM {fq_table}
+        WHERE _ingested_at = (SELECT MAX(_ingested_at) FROM {fq_table})
+    )"""
+
+
 def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
     """Retorna o dicionário de queries SQL de criação das tabelas da camada Silver."""
+    ibge_municipios = _latest_snapshot(project, bronze, "ibge_municipios")
+    meta_brasil = _latest_snapshot(project, bronze, "meta_alfabetizacao_brasil")
+    meta_uf = _latest_snapshot(project, bronze, "meta_alfabetizacao_uf")
+    meta_municipio = _latest_snapshot(project, bronze, "meta_alfabetizacao_municipio")
+    avaliacao_uf = _latest_snapshot(project, bronze, "avaliacao_alfabetizacao_uf")
+    avaliacao_municipio = _latest_snapshot(project, bronze, "avaliacao_alfabetizacao_municipio")
+
     return {
         "dim_localidades": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.dim_localidades`
             CLUSTER BY sigla_uf AS
-            SELECT 
+            SELECT
               LPAD(CAST(id_municipio AS STRING), 7, '0') AS id_municipio,
               TRIM(nome_municipio) AS nome_municipio,
               UPPER(TRIM(sigla_uf)) AS sigla_uf,
@@ -25,11 +59,11 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               UPPER(TRIM(sigla_regiao)) AS sigla_regiao,
               TRIM(nome_regiao) AS nome_regiao,
               CURRENT_TIMESTAMP() AS _processed_at
-            FROM `{project}.{bronze}.ibge_municipios`
+            FROM {ibge_municipios}
         """,
         "meta_alfabetizacao_brasil": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.meta_alfabetizacao_brasil` AS
-            SELECT 
+            SELECT
               CAST(ano AS INT64) AS ano,
               TRIM(rede) AS rede,
               CAST(taxa_alfabetizacao AS FLOAT64) AS taxa_alfabetizacao,
@@ -42,12 +76,12 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               CAST(meta_alfabetizacao_2030 AS FLOAT64) AS meta_2030,
               CAST(percentual_participacao AS FLOAT64) AS percentual_participacao,
               CURRENT_TIMESTAMP() AS _processed_at
-            FROM `{project}.{bronze}.meta_alfabetizacao_brasil`
+            FROM {meta_brasil}
         """,
         "meta_alfabetizacao_uf": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.meta_alfabetizacao_uf`
             CLUSTER BY sigla_uf AS
-            SELECT 
+            SELECT
               CAST(ano AS INT64) AS ano,
               UPPER(TRIM(sigla_uf)) AS sigla_uf,
               TRIM(rede) AS rede,
@@ -61,15 +95,18 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               CAST(meta_alfabetizacao_2030 AS FLOAT64) AS meta_2030,
               CAST(percentual_participacao AS FLOAT64) AS percentual_participacao,
               CURRENT_TIMESTAMP() AS _processed_at
-            FROM `{project}.{bronze}.meta_alfabetizacao_uf`
+            FROM {meta_uf}
         """,
+        # meta_alfabetizacao_municipio: só entra na Silver "de verdade"
+        # quem casa com dim_localidades (INNER JOIN). Quem não casa vai
+        # para a quarentena, com o motivo - em vez de virar 'ND'.
         "meta_alfabetizacao_municipio": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.meta_alfabetizacao_municipio`
             CLUSTER BY sigla_uf, id_municipio AS
-            SELECT 
+            SELECT
               CAST(m.ano AS INT64) AS ano,
               LPAD(CAST(m.id_municipio AS STRING), 7, '0') AS id_municipio,
-              COALESCE(loc.sigla_uf, 'ND') AS sigla_uf,
+              loc.sigla_uf AS sigla_uf,
               TRIM(m.rede) AS rede,
               CAST(m.taxa_alfabetizacao AS FLOAT64) AS taxa_alfabetizacao,
               CAST(m.meta_alfabetizacao_2024 AS FLOAT64) AS meta_2024,
@@ -82,19 +119,30 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               CAST(m.nivel_alfabetizacao AS INT64) AS nivel_alfabetizacao,
               CAST(m.percentual_participacao AS FLOAT64) AS percentual_participacao,
               CURRENT_TIMESTAMP() AS _processed_at
-            FROM `{project}.{bronze}.meta_alfabetizacao_municipio` m
+            FROM {meta_municipio} m
+            INNER JOIN `{project}.{silver}.dim_localidades` loc
+              ON LPAD(CAST(m.id_municipio AS STRING), 7, '0') = loc.id_municipio
+        """,
+        "quarentena_meta_alfabetizacao_municipio": f"""
+            CREATE OR REPLACE TABLE `{project}.{silver}.quarentena_meta_alfabetizacao_municipio` AS
+            SELECT
+              m.*,
+              'id_municipio não encontrado em dim_localidades' AS _motivo_quarentena,
+              CURRENT_TIMESTAMP() AS _quarantined_at
+            FROM {meta_municipio} m
             LEFT JOIN `{project}.{silver}.dim_localidades` loc
               ON LPAD(CAST(m.id_municipio AS STRING), 7, '0') = loc.id_municipio
+            WHERE loc.id_municipio IS NULL
         """,
         "avaliacao_alfabetizacao_uf": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.avaliacao_alfabetizacao_uf`
             PARTITION BY RANGE_BUCKET(ano, GENERATE_ARRAY(2020, 2040, 1))
             CLUSTER BY sigla_uf AS
-            SELECT 
+            SELECT
               CAST(ano AS INT64) AS ano,
               UPPER(TRIM(sigla_uf)) AS sigla_uf,
               CAST(serie AS INT64) AS serie,
-              TRIM(rede) AS rede,
+              CAST(rede AS STRING) AS rede,
               CAST(taxa_alfabetizacao AS FLOAT64) AS taxa_alfabetizacao,
               CAST(media_portugues AS FLOAT64) AS media_portugues,
               CAST(proporcao_aluno_nivel_0 AS FLOAT64) AS proporcao_aluno_nivel_0,
@@ -107,18 +155,18 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               CAST(proporcao_aluno_nivel_7 AS FLOAT64) AS proporcao_aluno_nivel_7,
               CAST(proporcao_aluno_nivel_8 AS FLOAT64) AS proporcao_aluno_nivel_8,
               CURRENT_TIMESTAMP() AS _processed_at
-            FROM `{project}.{bronze}.avaliacao_alfabetizacao_uf`
+            FROM {avaliacao_uf}
         """,
         "avaliacao_alfabetizacao_municipio": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.avaliacao_alfabetizacao_municipio`
             PARTITION BY RANGE_BUCKET(ano, GENERATE_ARRAY(2020, 2040, 1))
             CLUSTER BY sigla_uf, id_municipio AS
-            SELECT 
+            SELECT
               CAST(m.ano AS INT64) AS ano,
               LPAD(CAST(m.id_municipio AS STRING), 7, '0') AS id_municipio,
-              COALESCE(loc.sigla_uf, 'ND') AS sigla_uf,
+              loc.sigla_uf AS sigla_uf,
               CAST(m.serie AS INT64) AS serie,
-              TRIM(m.rede) AS rede,
+              CAST(m.rede AS STRING) AS rede,
               CAST(m.taxa_alfabetizacao AS FLOAT64) AS taxa_alfabetizacao,
               CAST(m.media_portugues AS FLOAT64) AS media_portugues,
               CAST(m.proporcao_aluno_nivel_0 AS FLOAT64) AS proporcao_aluno_nivel_0,
@@ -131,23 +179,38 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               CAST(m.proporcao_aluno_nivel_7 AS FLOAT64) AS proporcao_aluno_nivel_7,
               CAST(m.proporcao_aluno_nivel_8 AS FLOAT64) AS proporcao_aluno_nivel_8,
               CURRENT_TIMESTAMP() AS _processed_at
-            FROM `{project}.{bronze}.avaliacao_alfabetizacao_municipio` m
-            LEFT JOIN `{project}.{silver}.dim_localidades` loc
+            FROM {avaliacao_municipio} m
+            INNER JOIN `{project}.{silver}.dim_localidades` loc
               ON LPAD(CAST(m.id_municipio AS STRING), 7, '0') = loc.id_municipio
         """,
+        "quarentena_avaliacao_alfabetizacao_municipio": f"""
+            CREATE OR REPLACE TABLE `{project}.{silver}.quarentena_avaliacao_alfabetizacao_municipio` AS
+            SELECT
+              m.*,
+              'id_municipio não encontrado em dim_localidades' AS _motivo_quarentena,
+              CURRENT_TIMESTAMP() AS _quarantined_at
+            FROM {avaliacao_municipio} m
+            LEFT JOIN `{project}.{silver}.dim_localidades` loc
+              ON LPAD(CAST(m.id_municipio AS STRING), 7, '0') = loc.id_municipio
+            WHERE loc.id_municipio IS NULL
+        """,
+        # dados_alunos_streaming: cada linha na Bronze já é um evento
+        # individual (não um snapshot completo), então aqui não se
+        # aplica _latest_snapshot - a deduplicação por id_aluno/ano
+        # continua sendo o que decide qual versão do evento vale.
         "dados_alunos_streaming": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.dados_alunos_streaming`
             PARTITION BY RANGE_BUCKET(ano, GENERATE_ARRAY(2020, 2040, 1))
             CLUSTER BY sigla_uf, id_municipio AS
             WITH RankedAlunos AS (
-              SELECT 
+              SELECT
                 CAST(ano AS INT64) AS ano,
                 LPAD(CAST(id_municipio AS STRING), 7, '0') AS id_municipio,
                 TRIM(id_escola) AS id_escola,
                 TRIM(id_aluno) AS id_aluno,
                 CAST(caderno AS INT64) AS caderno,
                 CAST(serie AS INT64) AS serie,
-                CASE 
+                CASE
                   WHEN rede = 1 THEN 'Federal'
                   WHEN rede = 2 THEN 'Estadual'
                   WHEN rede = 3 THEN 'Municipal'
@@ -160,15 +223,15 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
                 CAST(proficiencia AS FLOAT64) AS proficiencia,
                 CAST(peso_aluno AS FLOAT64) AS peso_aluno,
                 ROW_NUMBER() OVER (
-                  PARTITION BY id_aluno, ano 
+                  PARTITION BY id_aluno, ano
                   ORDER BY _ingested_at DESC
                 ) as rn
               FROM `{project}.{bronze}.dados_alunos_streaming`
             )
-            SELECT 
+            SELECT
               a.ano,
               a.id_municipio,
-              COALESCE(loc.sigla_uf, 'ND') AS sigla_uf,
+              loc.sigla_uf AS sigla_uf,
               a.id_escola,
               a.id_aluno,
               a.caderno,
@@ -181,10 +244,31 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               a.peso_aluno,
               CURRENT_TIMESTAMP() AS _processed_at
             FROM RankedAlunos a
-            LEFT JOIN `{project}.{silver}.dim_localidades` loc
+            INNER JOIN `{project}.{silver}.dim_localidades` loc
               ON a.id_municipio = loc.id_municipio
             WHERE a.rn = 1
-        """
+        """,
+        "quarentena_dados_alunos_streaming": f"""
+            CREATE OR REPLACE TABLE `{project}.{silver}.quarentena_dados_alunos_streaming` AS
+            WITH RankedAlunos AS (
+              SELECT
+                *,
+                LPAD(CAST(id_municipio AS STRING), 7, '0') AS id_municipio_padded,
+                ROW_NUMBER() OVER (
+                  PARTITION BY id_aluno, ano
+                  ORDER BY _ingested_at DESC
+                ) as rn
+              FROM `{project}.{bronze}.dados_alunos_streaming`
+            )
+            SELECT
+              a.* EXCEPT(id_municipio_padded, rn),
+              'id_municipio não encontrado em dim_localidades' AS _motivo_quarentena,
+              CURRENT_TIMESTAMP() AS _quarantined_at
+            FROM RankedAlunos a
+            LEFT JOIN `{project}.{silver}.dim_localidades` loc
+              ON a.id_municipio_padded = loc.id_municipio
+            WHERE a.rn = 1 AND loc.id_municipio IS NULL
+        """,
     }
 
 
@@ -193,15 +277,20 @@ def execute_transformations() -> None:
     client = bigquery.Client(project=settings.project_id)
     queries = get_queries(settings.project_id, settings.dataset_bronze, settings.dataset_silver)
 
-    # dim_localidades DEVE rodar primeiro pois outras tabelas dependem dela para JOIN
+    # dim_localidades DEVE rodar primeiro pois outras tabelas dependem dela para JOIN.
+    # As tabelas de quarentena rodam logo depois da tabela Silver correspondente,
+    # reaproveitando o mesmo filtro de snapshot mais recente.
     order = [
         "dim_localidades",
         "meta_alfabetizacao_brasil",
         "meta_alfabetizacao_uf",
         "meta_alfabetizacao_municipio",
+        "quarentena_meta_alfabetizacao_municipio",
         "avaliacao_alfabetizacao_uf",
         "avaliacao_alfabetizacao_municipio",
-        "dados_alunos_streaming"
+        "quarentena_avaliacao_alfabetizacao_municipio",
+        "dados_alunos_streaming",
+        "quarentena_dados_alunos_streaming",
     ]
 
     for table_name in order:
