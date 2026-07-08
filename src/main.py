@@ -43,3 +43,18 @@ def streaming_consumer_pubsub(event: CloudEvent):
     errors = bq_client.insert_rows_json(table_id, [coerce_row(row)])
     if errors:
         raise RuntimeError(f"Erro ao inserir no BigQuery: {errors}")
+
+
+@functions_framework.http
+def silver_transform_http(request):
+    """Executa a transformação e validação da camada Silver.
+
+    Acionada via HTTP por orquestradores (como Cloud Scheduler ou chamada direta).
+    """
+    from silver.transform_silver import execute_transformations
+    from quality.data_quality import validate_silver_layer
+    
+    execute_transformations()
+    validate_silver_layer()
+    return ("Transformações e testes de qualidade da camada Silver concluídos com sucesso", 200)
+
