@@ -3,8 +3,8 @@
 Duas origens diferentes:
 - As 5 fontes do INEP (metas + resultados) e os microdados de aluno já
   existem como tabelas BigQuery públicas da Base dos Dados (projeto
-  `basedosdados`) - carregadas via CTAS cross-project, sem baixar CSV
-  nem passar pelo GCS.
+  `basedosdados`) - carregadas via consulta cross-project, sem baixar
+  CSV nem passar pelo GCS.
 - A dimensão IBGE (município/UF) não tem tabela pública equivalente,
   então continua vindo de um CSV (bronze/ibge_reference.py) subido ao
   nosso próprio bucket.
@@ -12,6 +12,13 @@ Duas origens diferentes:
 Em ambos os casos, a tabela final só ganha metadados de ingestão
 (_ingested_at, _source_file) - sem transformação de conteúdo, como
 esperado da camada Bronze.
+
+Importante: a Bronze é **append-only**. Cada execução acrescenta um
+novo snapshot com seu próprio `_ingested_at`, em vez de sobrescrever o
+anterior - é assim que preservamos "histórico completo", como pede o
+enunciado. Quem lê a Bronze (a Silver, por exemplo) é responsável por
+filtrar o snapshot mais recente quando quiser o estado atual; a Bronze
+em si nunca decide isso por conta própria.
 """
 import datetime as dt
 import logging
@@ -52,12 +59,20 @@ def load_from_basedosdados(bq_client: bigquery.Client, dataset_id: str, source: 
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         autodetect=True,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        # WRITE_APPEND (não WRITE_TRUNCATE): cada execução vira um novo
+        # snapshot na Bronze, preservando o histórico completo.
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
     bq_client.load_table_from_json(rows, final_table_id, job_config=job_config).result()
 
     table = bq_client.get_table(final_table_id)
-    logger.info("Bronze carregada de %s: %s (%d linhas)", source_table, final_table_id, table.num_rows)
+    logger.info(
+        "Bronze carregada de %s: %s (snapshot com %d linhas, %d linhas no total acumulado)",
+        source_table,
+        final_table_id,
+        len(rows),
+        table.num_rows,
+    )
 
 
 # --- fluxo CSV -> GCS -> BigQuery, mantido só para a dimensão IBGE,
@@ -82,9 +97,8 @@ def _gcs_uri(bucket_name: str, source: BronzeSource) -> str:
 
 
 def load_csv_to_bigquery(bq_client: bigquery.Client, dataset_id: str, gcs_uri: str, source: BronzeSource) -> None:
-    # Carrega primeiro numa tabela de staging (schema autodetectado),
-    # depois materializa a tabela Bronze final já com os metadados de
-    # ingestão via CTAS - evita um ALTER + UPDATE de duas passadas.
+    # A staging table é sempre truncada (é só um degrau intermediário
+    # e descartável); a tabela final é que precisa ser append-only.
     stg_table_id = f"{bq_client.project}.{dataset_id}.{source.table_name}_stg"
     final_table_id = f"{bq_client.project}.{dataset_id}.{source.table_name}"
 
@@ -96,19 +110,24 @@ def load_csv_to_bigquery(bq_client: bigquery.Client, dataset_id: str, gcs_uri: s
     )
     bq_client.load_table_from_uri(gcs_uri, stg_table_id, job_config=job_config).result()
 
-    ctas_query = f"""
-        CREATE OR REPLACE TABLE `{final_table_id}` AS
+    # Acrescenta o snapshot na tabela final via query com destino
+    # (WRITE_APPEND), em vez de CREATE OR REPLACE - preserva as
+    # cargas anteriores.
+    append_query = f"""
         SELECT *, CURRENT_TIMESTAMP() AS _ingested_at, @source_file AS _source_file
         FROM `{stg_table_id}`
     """
     query_job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("source_file", "STRING", source.file_name)]
+        query_parameters=[bigquery.ScalarQueryParameter("source_file", "STRING", source.file_name)],
+        destination=final_table_id,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
     )
-    bq_client.query(ctas_query, job_config=query_job_config).result()
+    bq_client.query(append_query, job_config=query_job_config).result()
     bq_client.delete_table(stg_table_id, not_found_ok=True)
 
     table = bq_client.get_table(final_table_id)
-    logger.info("Bronze carregada: %s (%d linhas)", final_table_id, table.num_rows)
+    logger.info("Bronze carregada: %s (%d linhas no total acumulado)", final_table_id, table.num_rows)
 
 
 def run() -> None:
