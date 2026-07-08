@@ -1,4 +1,18 @@
-"""Catálogo das fontes brutas e para onde cada uma vai na camada Bronze."""
+"""Catálogo das fontes brutas e para onde cada uma vai na camada Bronze.
+
+Há dois tipos de fonte aqui, e vale a pena entender a diferença:
+
+- BasedosdadosSource: tabelas do INEP que a própria Base dos Dados já
+  publica como tabelas BigQuery públicas (projeto `basedosdados`).
+  Carregamos direto de lá via consulta cross-project - sem baixar CSV,
+  sem passar por GCS. Confirmado manualmente que o dataset
+  `basedosdados.br_inep_avaliacao_alfabetizacao` tem exatamente as
+  tabelas que a gente precisa (`meta_alfabetizacao_brasil/uf/municipio`,
+  `uf`, `municipio`, `alunos`).
+- BronzeSource: a dimensão IBGE, que não existe como tabela pública
+  equivalente - por isso continua vindo de um CSV buscado da API do
+  IBGE (ibge_reference.py) e subido ao nosso próprio bucket GCS.
+"""
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,37 +34,41 @@ RAW_DATA_DIR = Path(os.environ.get("RAW_DATA_DIR", _default_raw_data_dir()))
 
 @dataclass(frozen=True)
 class BronzeSource:
+    """Fonte baseada em arquivo local -> GCS -> BigQuery (bootstrap)."""
+
     file_name: str
     table_name: str
 
 
-# Fontes de ingestão batch: metas e resultados agregados (baixo volume,
-# atualização periódica) -> GCS + BigQuery bronze, sem transformação.
-BATCH_SOURCES = [
-    BronzeSource(
-        "br_inep_avaliacao_alfabetizacao_meta_alfabetizacao_brasil.csv",
-        "meta_alfabetizacao_brasil",
-    ),
-    BronzeSource(
-        "br_inep_avaliacao_alfabetizacao_meta_alfabetizacao_uf.csv",
-        "meta_alfabetizacao_uf",
-    ),
-    BronzeSource(
-        "br_inep_avaliacao_alfabetizacao_meta_alfabetizacao_municipio.csv",
-        "meta_alfabetizacao_municipio",
-    ),
-    BronzeSource(
-        "br_inep_avaliacao_alfabetizacao_uf.csv",
-        "avaliacao_alfabetizacao_uf",
-    ),
-    BronzeSource(
-        "br_inep_avaliacao_alfabetizacao_municipio.csv",
-        "avaliacao_alfabetizacao_municipio",
-    ),
+@dataclass(frozen=True)
+class BasedosdadosSource:
+    """Fonte já publicada como tabela BigQuery pública pela Base dos
+    Dados - carregada via CTAS cross-project, sem passar por GCS.
+    """
+
+    bd_table: str
+    table_name: str
+
+
+BASEDOSDADOS_PROJECT = "basedosdados"
+BASEDOSDADOS_DATASET = "br_inep_avaliacao_alfabetizacao"
+
+# Fontes de ingestão batch: metas e resultados agregados, direto do
+# BigQuery público da Base dos Dados (baixo volume, atualização
+# periódica na origem) -> Bronze, sem transformação.
+BD_BATCH_SOURCES = [
+    BasedosdadosSource("meta_alfabetizacao_brasil", "meta_alfabetizacao_brasil"),
+    BasedosdadosSource("meta_alfabetizacao_uf", "meta_alfabetizacao_uf"),
+    BasedosdadosSource("meta_alfabetizacao_municipio", "meta_alfabetizacao_municipio"),
+    BasedosdadosSource("uf", "avaliacao_alfabetizacao_uf"),
+    BasedosdadosSource("municipio", "avaliacao_alfabetizacao_municipio"),
 ]
 
-# Microdados de aluno: granularidade de evento, usados na simulação de streaming.
-STREAMING_SOURCE = BronzeSource("Dados de alunos.csv", "dados_alunos_streaming")
+# Microdados de aluno: granularidade de evento, usados na simulação de
+# streaming - também lidos direto da tabela pública `alunos`.
+STREAMING_SOURCE = BasedosdadosSource("alunos", "dados_alunos_streaming")
 
-# Dimensão de referência (UF/Município), buscada da API do IBGE - ver ibge_reference.py.
+# Dimensão de referência (UF/Município), buscada da API do IBGE - ver
+# ibge_reference.py. Continua sendo CSV -> GCS -> BigQuery porque a
+# Base dos Dados não publica uma tabela equivalente com nomes/região.
 IBGE_REFERENCE_SOURCE = BronzeSource("ibge_municipios.csv", "ibge_municipios")

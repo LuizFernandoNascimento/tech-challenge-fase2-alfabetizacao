@@ -33,15 +33,17 @@ Este projeto atua como se fosse o time de engenharia de dados de uma organizaç�
 
 Todas as fontes vêm da plataforma [Base dos Dados](https://basedosdados.org/), tabela do indicador Criança Alfabetizada (INEP). Ver detalhamento completo em [`docs/data_dictionary.md`](docs/data_dictionary.md).
 
-| Entidade | Arquivo de origem | Volume |
+A Base dos Dados já publica esse dataset como tabelas **BigQuery públicas** (projeto `basedosdados`, dataset `br_inep_avaliacao_alfabetizacao`) — por isso a ingestão batch consulta essas tabelas diretamente por *cross-project query*, em vez de depender de um export em CSV. A única exceção é a dimensão IBGE (UF/Município com nome/região), que não existe como tabela pública equivalente.
+
+| Entidade | Tabela de origem (`basedosdados.br_inep_avaliacao_alfabetizacao.*`) | Volume |
 |---|---|---|
-| Dados de alunos (microdados) | `Dados de alunos.csv` | ~3,87M linhas / 214MB |
-| Meta Alfabetização Brasil | `..._meta_alfabetizacao_brasil.csv` | 3 linhas |
-| Meta Alfabetização UF | `..._meta_alfabetizacao_uf.csv` | 54 linhas |
-| Meta Alfabetização Município | `..._meta_alfabetizacao_municipio.csv` | ~10,7k linhas |
-| Avaliação Alfabetização UF | `br_inep_avaliacao_alfabetizacao_uf.csv` | 145 linhas |
-| Avaliação Alfabetização Município | `br_inep_avaliacao_alfabetizacao_municipio.csv` | ~24k linhas |
-| Dimensão UF/Município (IBGE, complementar) | API IBGE `localidades/municipios` | 5.571 municípios |
+| Dados de alunos (microdados) | `alunos` | ~3,87M linhas |
+| Meta Alfabetização Brasil | `meta_alfabetizacao_brasil` | 3 linhas |
+| Meta Alfabetização UF | `meta_alfabetizacao_uf` | 81 linhas |
+| Meta Alfabetização Município | `meta_alfabetizacao_municipio` | ~10,7k linhas |
+| Avaliação Alfabetização UF | `uf` | 145 linhas |
+| Avaliação Alfabetização Município | `municipio` | ~24k linhas |
+| Dimensão UF/Município (IBGE, complementar) | API IBGE `localidades/municipios` (fora da Base dos Dados) | 5.571 municípios |
 
 ## Arquitetura da solução
 
@@ -52,8 +54,8 @@ Visão geral adotada:
 - **Cloud**: Google Cloud Platform (projeto dedicado `tech-challenge-alfabetiza-25`, região `southamerica-east1`).
 - **Data Lake**: Google Cloud Storage (bucket `tech-challenge-alfabetiza-25-raw`, prefixo `bronze/<tabela>/<arquivo>`).
 - **Data Warehouse / Lakehouse analítico**: BigQuery, com datasets separados `bronze`, `silver`, `gold` — particionamento por `ano` e clusterização por `sigla_uf`/`id_municipio` planejados a partir da camada Silver.
-- **Ingestão batch** ([`src/bronze/batch_ingest.py`](src/bronze/batch_ingest.py)): sobe os 5 CSVs de metas/resultados agregados + a dimensão IBGE para o GCS, depois carrega cada um em uma tabela de staging no BigQuery (schema autodetectado) e materializa a tabela Bronze final via `CREATE OR REPLACE TABLE ... AS SELECT` acrescentando `_ingested_at`/`_source_file`.
-- **Ingestão streaming (simulada)** ([`src/streaming/producer.py`](src/streaming/producer.py) + [`src/streaming/consumer.py`](src/streaming/consumer.py)): um produtor replaya linhas do CSV de microdados de alunos como mensagens Pub/Sub, a uma taxa controlada; um consumidor faz *pull* das mensagens, acumula micro-lotes e grava via streaming insert na tabela `bronze.dados_alunos_streaming`.
+- **Ingestão batch** ([`src/bronze/batch_ingest.py`](src/bronze/batch_ingest.py)): as 5 tabelas de metas/resultados são lidas direto das tabelas públicas da Base dos Dados no BigQuery (`basedosdados.br_inep_avaliacao_alfabetizacao.*`) e regravadas na nossa Bronze com `_ingested_at`/`_source_file`; a dimensão IBGE continua vindo de CSV -> GCS -> BigQuery, já que não existe tabela pública equivalente.
+- **Ingestão streaming (simulada)** ([`src/streaming/producer.py`](src/streaming/producer.py) + [`src/streaming/consumer.py`](src/streaming/consumer.py)): um produtor consulta a tabela pública `alunos` no BigQuery e replaya as linhas como mensagens Pub/Sub, a uma taxa controlada; um consumidor faz *pull* das mensagens, acumula micro-lotes e grava via streaming insert na tabela `bronze.dados_alunos_streaming`.
 - **Dimensão de referência** ([`src/bronze/ibge_reference.py`](src/bronze/ibge_reference.py)): busca nome de UF/município/região na API pública do IBGE, já que nenhuma fonte do INEP traz esses atributos — apenas códigos.
 - **Provisionamento de infraestrutura** ([`src/bronze/setup_infra.py`](src/bronze/setup_infra.py)): script idempotente que cria bucket, datasets e tópico/assinatura Pub/Sub via `google-cloud-*` (sem Terraform, dado o tamanho do projeto).
 - **Camadas**: Bronze (dados brutos, sem transformação) → Silver (limpeza, padronização, normalização de chaves, integração/dimensões, validação de qualidade) → Gold (marts analíticos prontos para BI/ML).
@@ -65,14 +67,18 @@ Rodado contra o projeto GCP real:
 | Tabela Bronze | Linhas carregadas |
 |---|---|
 | `meta_alfabetizacao_brasil` | 3 |
-| `meta_alfabetizacao_uf` | 54 |
+| `meta_alfabetizacao_uf` | 81 |
 | `meta_alfabetizacao_municipio` | 10.704 |
 | `avaliacao_alfabetizacao_uf` | 145 |
 | `avaliacao_alfabetizacao_municipio` | 23.995 |
 | `ibge_municipios` | 5.571 |
-| `dados_alunos_streaming` (via Pub/Sub, amostra de teste) | 1.126 eventos (190 alunos distintos) |
+| `dados_alunos_streaming` (via Pub/Sub, amostra de teste) | 1.126+ eventos (190 alunos distintos na primeira rodada) |
 
-**Achado relevante**: na simulação streaming, o número de linhas gravadas superou o de alunos distintos publicados — o Pub/Sub garante *at-least-once delivery*, então mensagens podem ser reentregues e gravadas mais de uma vez. Isso é esperado e **correto** para a Bronze (que preserva os dados brutos exatamente como chegaram, duplicados inclusive); a deduplicação é responsabilidade da camada Silver.
+**Achado relevante nº 1**: na simulação streaming, o número de linhas gravadas superou o de alunos distintos publicados — o Pub/Sub garante *at-least-once delivery*, então mensagens podem ser reentregues e gravadas mais de uma vez. Isso é esperado e **correto** para a Bronze (que preserva os dados brutos exatamente como chegaram, duplicados inclusive); a deduplicação é responsabilidade da camada Silver.
+
+**Achado relevante nº 2 — CSV local vs. BigQuery público**: a ingestão batch originalmente subia os CSVs (já baixados localmente) para o GCS e carregava de lá. Ao revisar a fonte oficial, percebemos que a Base dos Dados já publica esse dataset como tabelas BigQuery públicas (`basedosdados.br_inep_avaliacao_alfabetizacao`) — então migramos a ingestão para consultar essas tabelas direto, por *cross-project query*, eliminando a necessidade de baixar/reenviar CSV para 5 das 6 fontes (a dimensão IBGE continua sendo a exceção). Um efeito colateral bom: `meta_alfabetizacao_uf` passou de 54 para 81 linhas, porque a tabela pública está mais atualizada que o CSV estático que tínhamos.
+
+Um detalhe técnico que essa mudança expôs: a tabela pública da Base dos Dados vive na multi-region `US`, enquanto nosso dataset Bronze vive em `southamerica-east1`. O BigQuery não permite um `CREATE TABLE ... AS SELECT` cross-region direto (todas as tabelas referenciadas num job precisam estar na mesma location) — a solução foi rodar a consulta em `US`, trazer o resultado (poucas linhas, exceto a tabela de alunos que já é tratada à parte pelo streaming) para o processo Python, e gravar na nossa location via `load_table_from_json`. Ver comentários em `bronze/batch_ingest.py::load_from_basedosdados`.
 
 ### Bronze — deployado como Cloud Functions (Gen2)
 
@@ -140,7 +146,8 @@ PYTHONPATH=src python -m bronze.setup_infra
 # Busca a dimensão de referência UF/Município na API do IBGE
 PYTHONPATH=src python -m bronze.ibge_reference
 
-# Ingestão batch: sobe e carrega os 5 CSVs de metas/resultados + a dimensão IBGE
+# Ingestão batch: lê as 5 tabelas de metas/resultados direto do BigQuery
+# público da Base dos Dados + sobe/carrega a dimensão IBGE via CSV
 PYTHONPATH=src python -m bronze.batch_ingest
 
 # Ingestão streaming (simulação): rodar em dois terminais
