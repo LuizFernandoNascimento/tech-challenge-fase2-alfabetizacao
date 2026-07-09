@@ -1,29 +1,22 @@
 """Executa validações de qualidade e consistência (QA) na Camada Silver.
-
 Verifica duplicidades, valores nulos em chaves primárias, integridade referencial
 e sanidade de limites de valores.
 """
 import logging
 from google.cloud import bigquery
 from bronze.config import load_settings
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-
 def run_check(client: bigquery.Client, query: str, check_name: str, critical: bool = True) -> int:
     """Executa uma query de validação e retorna a contagem de falhas.
-
     Se critical for True e houver falhas, levanta um erro.
     """
     logger.info("Executando QA: %s", check_name)
     query_job = client.query(query)
     results = query_job.result()
-
     # As queries de QA devem retornar uma linha com a coluna 'failed_count'
     row = next(iter(results))
     failed_count = row["failed_count"]
-
     if failed_count > 0:
         msg = f"Falha no teste [{check_name}]: {failed_count} registros violaram a regra."
         if critical:
@@ -33,22 +26,17 @@ def run_check(client: bigquery.Client, query: str, check_name: str, critical: bo
             logger.warning(msg)
     else:
         logger.info("Sucesso no teste [%s]", check_name)
-
     return failed_count
-
-
 def validate_silver_layer() -> None:
     settings = load_settings()
     client = bigquery.Client(project=settings.project_id)
     silver = settings.dataset_silver
-
     # 1. Testes de Unicidade (Chaves Primárias)
     run_check(
         client,
         f"SELECT COUNT(*) - COUNT(DISTINCT id_municipio) AS failed_count FROM `{client.project}.{silver}.dim_localidades`",
         "dim_localidades - unicidade de id_municipio"
     )
-
     run_check(
         client,
         f"""
@@ -57,7 +45,6 @@ def validate_silver_layer() -> None:
         """,
         "dados_alunos_streaming - unicidade de id_aluno por ano"
     )
-
     run_check(
         client,
         f"""
@@ -66,7 +53,6 @@ def validate_silver_layer() -> None:
         """,
         "meta_alfabetizacao_uf - unicidade de ano + sigla_uf + rede"
     )
-
     # 2. Testes de Valores Nulos em Colunas Críticas
     run_check(
         client,
@@ -77,7 +63,6 @@ def validate_silver_layer() -> None:
         """,
         "dim_localidades - nulos em chaves e colunas obrigatórias"
     )
-
     run_check(
         client,
         f"""
@@ -87,7 +72,6 @@ def validate_silver_layer() -> None:
         """,
         "dados_alunos_streaming - nulos em colunas obrigatórias"
     )
-
     # 3. Testes de Integridade Referencial (Chaves Estrangeiras)
     #
     # As tabelas Silver principais agora usam INNER JOIN com
@@ -104,7 +88,6 @@ def validate_silver_layer() -> None:
         """,
         "dados_alunos_streaming - id_municipio inexistente em dim_localidades"
     )
-
     run_check(
         client,
         f"""
@@ -115,7 +98,6 @@ def validate_silver_layer() -> None:
         """,
         "avaliacao_alfabetizacao_municipio - id_municipio inexistente em dim_localidades"
     )
-
     run_check(
         client,
         f"""
@@ -126,7 +108,6 @@ def validate_silver_layer() -> None:
         """,
         "meta_alfabetizacao_municipio - id_municipio inexistente em dim_localidades"
     )
-
     # 3b. Observabilidade das tabelas de quarentena: registros que não
     # casaram com dim_localidades não travam mais o pipeline (ver
     # transform_silver.py), mas o volume de quarentena é reportado
@@ -138,21 +119,18 @@ def validate_silver_layer() -> None:
         "meta_alfabetizacao_municipio - volume em quarentena",
         critical=False,
     )
-
     run_check(
         client,
         f"SELECT COUNT(*) AS failed_count FROM `{client.project}.{silver}.quarentena_avaliacao_alfabetizacao_municipio`",
         "avaliacao_alfabetizacao_municipio - volume em quarentena",
         critical=False,
     )
-
     run_check(
         client,
         f"SELECT COUNT(*) AS failed_count FROM `{client.project}.{silver}.quarentena_dados_alunos_streaming`",
         "dados_alunos_streaming - volume em quarentena",
         critical=False,
     )
-
     # 4. Testes de Ranges e Sanidade (Valores Válidos)
     run_check(
         client,
@@ -163,7 +141,6 @@ def validate_silver_layer() -> None:
         """,
         "dados_alunos_streaming - presenca e alfabetizado devem ser 0 ou 1"
     )
-
     run_check(
         client,
         f"""
@@ -174,9 +151,81 @@ def validate_silver_layer() -> None:
         "avaliacao_alfabetizacao_uf - taxa_alfabetizacao deve estar entre 0.0 e 100.0",
         critical=False # Aviso, não trava pipeline caso ocorram taxas fora de limites (para tratar erros de fonte de dados)
     )
-
     logger.info("Todas as validações de qualidade da camada Silver passaram com sucesso!")
-
-
+def validate_gold_layer() -> None:
+    settings = load_settings()
+    client = bigquery.Client(project=settings.project_id)
+    gold = settings.dataset_gold
+    # 1. Testes de Unicidade (Chaves Primárias)
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(ano AS STRING), '-', COALESCE(id_municipio, ''), '-', COALESCE(rede, ''))) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_municipio`
+        """,
+        "mart_comparativo_municipio - unicidade de ano + id_municipio + rede"
+    )
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(ano AS STRING), '-', COALESCE(sigla_uf, ''), '-', COALESCE(rede, ''))) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_uf`
+        """,
+        "mart_comparativo_uf - unicidade de ano + sigla_uf + rede"
+    )
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(ano AS STRING), '-', COALESCE(rede, ''))) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_brasil`
+        """,
+        "mart_comparativo_brasil - unicidade de ano + rede"
+    )
+    # 2. Testes de Valores Nulos em Colunas Críticas
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_municipio`
+        WHERE ano IS NULL OR id_municipio IS NULL OR rede IS NULL
+        """,
+        "mart_comparativo_municipio - nulos em colunas obrigatórias"
+    )
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_uf`
+        WHERE ano IS NULL OR sigla_uf IS NULL OR rede IS NULL
+        """,
+        "mart_comparativo_uf - nulos em colunas obrigatórias"
+    )
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_brasil`
+        WHERE ano IS NULL OR rede IS NULL
+        """,
+        "mart_comparativo_brasil - nulos em colunas obrigatórias"
+    )
+    # 3. Testes de Ranges e Sanidade (Valores Válidos)
+    run_check(
+        client,
+        f"""
+        SELECT COUNT(*) AS failed_count
+        FROM `{client.project}.{gold}.mart_comparativo_municipio`
+        WHERE (taxa_alfabetizacao_real < 0.0 OR taxa_alfabetizacao_real > 100.0)
+           OR (taxa_alfabetizacao_streaming < 0.0 OR taxa_alfabetizacao_streaming > 100.0)
+           OR (meta_taxa_alfabetizacao < 0.0 OR meta_taxa_alfabetizacao > 100.0)
+        """,
+        "mart_comparativo_municipio - taxas devem estar entre 0.0 e 100.0",
+        critical=False
+    )
+    logger.info("Todas as validações de qualidade da camada Gold passaram com sucesso!")
 if __name__ == "__main__":
-    validate_silver_layer()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "gold":
+        validate_gold_layer()
+    else:
+        validate_silver_layer()
