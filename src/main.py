@@ -1,8 +1,6 @@
 """Pontos de entrada das Cloud Functions (Gen2) da camada Bronze.
-
 Duas funções deployadas a partir deste mesmo arquivo (uma por
 --entry-point na hora do `gcloud functions deploy`):
-
 - batch_ingest_http: acionada via HTTP pelo Cloud Scheduler, roda a
   ingestão batch completa (mesma lógica de bronze/batch_ingest.py).
 - streaming_consumer_pubsub: acionada automaticamente pelo Pub/Sub a
@@ -14,41 +12,31 @@ Duas funções deployadas a partir deste mesmo arquivo (uma por
 """
 import base64
 import json
-
 import functions_framework
 from cloudevents.http import CloudEvent
 from google.cloud import bigquery
-
 from bronze.config import load_settings
 from bronze.batch_ingest import reload_bronze_from_gcs
 from bronze.streaming_schema import coerce_row, ensure_streaming_table
-
-
 @functions_framework.http
 def batch_ingest_http(request):
     # Não há disco local na nuvem: a função relê os arquivos que o
     # bootstrap local (bronze/batch_ingest.py::run) já deixou no GCS.
     reload_bronze_from_gcs()
     return ("Ingestão batch concluída", 200)
-
-
 @functions_framework.cloud_event
 def streaming_consumer_pubsub(event: CloudEvent):
     settings = load_settings()
     bq_client = bigquery.Client(project=settings.project_id)
     table_id = ensure_streaming_table(bq_client, settings.dataset_bronze)
-
     payload = base64.b64decode(event.data["message"]["data"])
     row = json.loads(payload.decode("utf-8"))
     errors = bq_client.insert_rows_json(table_id, [coerce_row(row)])
     if errors:
         raise RuntimeError(f"Erro ao inserir no BigQuery: {errors}")
-
-
 @functions_framework.http
 def silver_transform_http(request):
     """Executa a transformação e validação da camada Silver.
-
     Acionada via HTTP por orquestradores (como Cloud Scheduler ou chamada direta).
     """
     from silver.transform_silver import execute_transformations
@@ -57,4 +45,14 @@ def silver_transform_http(request):
     execute_transformations()
     validate_silver_layer()
     return ("Transformações e testes de qualidade da camada Silver concluídos com sucesso", 200)
-
+@functions_framework.http
+def gold_transform_http(request):
+    """Executa a transformação e validação da camada Gold.
+    Acionada via HTTP por orquestradores (como Cloud Scheduler ou chamada direta).
+    """
+    from gold.transform_gold import execute_gold_transformations
+    from quality.data_quality import validate_gold_layer
+    
+    execute_gold_transformations()
+    validate_gold_layer()
+    return ("Transformações e testes de qualidade da camada Gold concluídos com sucesso", 200)
