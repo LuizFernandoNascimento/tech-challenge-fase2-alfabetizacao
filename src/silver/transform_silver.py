@@ -26,6 +26,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+# Mapeamento oficial de código -> rótulo de rede, conforme a tabela
+# `dicionario` do próprio dataset `basedosdados.br_inep_avaliacao_alfabetizacao`.
+# Os rótulos de "Pública" (códigos 5 e 6) foram encurtados para bater
+# com o valor literal que já vem em meta_alfabetizacao_uf/brasil
+# ("Pública", sem o detalhamento entre parênteses) - sem isso, os
+# joins da camada Gold entre avaliação e meta nunca casam (ver PR #8).
+def _rede_label_case(column: str) -> str:
+    return f"""
+    CASE {column}
+      WHEN 1 THEN 'Federal'
+      WHEN 2 THEN 'Estadual'
+      WHEN 3 THEN 'Municipal'
+      WHEN 4 THEN 'Privada'
+      WHEN 5 THEN 'Pública'
+      WHEN 6 THEN 'Pública'
+      WHEN 0 THEN 'Total'
+      ELSE 'Desconhecida'
+    END
+    """
+
+
 def _latest_snapshot(project: str, bronze: str, table: str) -> str:
     """Fragmento SQL que filtra apenas o snapshot mais recente de uma
     tabela Bronze append-only (a Bronze pode ter vários `_ingested_at`
@@ -142,7 +163,7 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               CAST(ano AS INT64) AS ano,
               UPPER(TRIM(sigla_uf)) AS sigla_uf,
               CAST(serie AS INT64) AS serie,
-              CAST(rede AS STRING) AS rede,
+              {_rede_label_case("rede")} AS rede,
               CAST(taxa_alfabetizacao AS FLOAT64) AS taxa_alfabetizacao,
               CAST(media_portugues AS FLOAT64) AS media_portugues,
               CAST(proporcao_aluno_nivel_0 AS FLOAT64) AS proporcao_aluno_nivel_0,
@@ -166,7 +187,7 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               LPAD(CAST(m.id_municipio AS STRING), 7, '0') AS id_municipio,
               loc.sigla_uf AS sigla_uf,
               CAST(m.serie AS INT64) AS serie,
-              CAST(m.rede AS STRING) AS rede,
+              {_rede_label_case("m.rede")} AS rede,
               CAST(m.taxa_alfabetizacao AS FLOAT64) AS taxa_alfabetizacao,
               CAST(m.media_portugues AS FLOAT64) AS media_portugues,
               CAST(m.proporcao_aluno_nivel_0 AS FLOAT64) AS proporcao_aluno_nivel_0,
@@ -210,13 +231,7 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
                 TRIM(id_aluno) AS id_aluno,
                 CAST(caderno AS INT64) AS caderno,
                 CAST(serie AS INT64) AS serie,
-                CASE
-                  WHEN rede = 1 THEN 'Federal'
-                  WHEN rede = 2 THEN 'Estadual'
-                  WHEN rede = 3 THEN 'Municipal'
-                  WHEN rede = 4 THEN 'Privada'
-                  ELSE 'Desconhecida'
-                END AS rede,
+                {_rede_label_case("rede")} AS rede,
                 CAST(presenca AS INT64) AS presenca,
                 CAST(preenchimento_caderno AS INT64) AS preenchimento_caderno,
                 CAST(alfabetizado AS INT64) AS alfabetizado,
