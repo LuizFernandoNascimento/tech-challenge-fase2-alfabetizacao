@@ -13,7 +13,7 @@ Tech Challenge — Fase 2 (POSTECH/FIAP, AI Scientist). Pipeline de dados híbri
 - [Tecnologias e justificativa](#tecnologias-e-justificativa)
 - [Decisões arquiteturais e trade-offs](#decisões-arquiteturais-e-trade-offs) *(seção futura)*
 - [Qualidade de dados](#qualidade-de-dados) *(seção futura)*
-- [Monitoramento e FinOps](#monitoramento-e-finops) *(seção futura)*
+- [Monitoramento e FinOps](#monitoramento-e-finops)
 - [Aplicação em IA](#aplicação-em-ia) *(seção futura)*
 - [Como rodar](#como-rodar)
 
@@ -142,7 +142,12 @@ A camada Silver inclui um pipeline de qualidade de dados (`src/quality/data_qual
 
 ## Monitoramento e FinOps
 
-*(Seção futura.)*
+- **Controle de Custos (FinOps)**: particionamento por `ano` e clusterização por `sigla_uf`/`id_municipio` nas tabelas Silver/Gold (queries filtradas escaneiam menos bytes que um full scan); Cloud Functions Gen2 escalam a zero — sem custo de infraestrutura ociosa entre execuções. Estimativa de custo detalhada fica na apresentação executiva.
+- **Monitoramento e Alertas** (implementado, testado ponta a ponta contra o projeto real):
+  - **Log-based metric** `pipeline_errors` (Cloud Logging), contando erros das 4 Cloud Functions da pipeline. O filtro combina `severity=ERROR` **e** qualquer entrada no stream `stderr` — testamos publicando mensagens Pub/Sub malformadas de propósito e descobrimos que exceções Python não tratadas nesse runtime não chegam automaticamente com `severity=ERROR`; só olhar `severity=ERROR` deixaria passar falhas reais.
+  - **Alert policy** que dispara quando `pipeline_errors > 0`, notificando por e-mail via um *notification channel* dedicado.
+  - Validado de ponta a ponta: publicamos duas mensagens JSON inválidas em `dados-alunos-stream` e confirmamos que os erros reais gerados por `bronze-streaming-consumer` foram capturados pela métrica.
+  - A camada de qualidade de dados (`src/quality/data_quality.py`) funciona como uma segunda barreira, independente do monitoramento de infraestrutura: falhas críticas de unicidade/integridade param o pipeline antes de poluir tabelas analíticas; registros órfãos vão para tabelas de quarentena, reportadas como aviso (não crítico).
 
 ## Aplicação em IA
 
