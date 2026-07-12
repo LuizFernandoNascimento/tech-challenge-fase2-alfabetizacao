@@ -13,7 +13,7 @@ Tech Challenge — Fase 2 (POSTECH/FIAP, AI Scientist). Pipeline de dados híbri
 - [Tecnologias e justificativa](#tecnologias-e-justificativa)
 - [Decisões arquiteturais e trade-offs](#decisões-arquiteturais-e-trade-offs) *(seção futura)*
 - [Qualidade de dados](#qualidade-de-dados) *(seção futura)*
-- [Monitoramento e FinOps](#monitoramento-e-finops) *(seção futura)*
+- [Monitoramento e FinOps](#monitoramento-e-finops)
 - [Aplicação em IA](#aplicação-em-ia) *(seção futura)*
 - [Como rodar](#como-rodar)
 
