@@ -115,6 +115,25 @@ A transformação e validação da camada Silver também foram integradas ao `sr
 |---|---|---|---|
 | Cloud Function | `silver-transform` | HTTP (chamada via webhook ou Scheduler) | `ACTIVE` |
 
+### Gold — Camada Analítica e Comparativa (Marts)
+
+A camada Gold consome as tabelas consolidadas da camada Silver para produzir datasets prontos para BI (dashboards), análises estatísticas e modelos de IA/ML. O foco está na comparação entre metas e resultados observados, unificando dados históricos e dados em streaming quase tempo real.
+
+Tabelas criadas:
+- **`mart_comparativo_municipio`**: Nível Município + Rede + Ano. Consolidado que junta os resultados das avaliações municipais da Silver, as respectivas metas e os dados de streaming de alunos agregados por município, calculando desvios e sinalizadores se a meta foi batida.
+- **`mart_comparativo_uf`**: Nível Estado (UF) + Rede + Ano. Similar à tabela municipal, mas agregada na escala estadual (com nome do estado e região trazidos via dimensão localidades).
+- **`mart_comparativo_brasil`**: Nível Nacional (Brasil) + Rede + Ano. Consolidado das metas nacionais e das taxas gerais de alfabetização por rede, incluindo agregação nacional do fluxo streaming.
+
+**Performance e FinOps na Gold**: Assim como na Silver, as tabelas `mart_comparativo_municipio` e `mart_comparativo_uf` são fisicamente particionadas por `ano` (com `RANGE_BUCKET`) e clusterizadas pelas chaves primárias e geográficas (`sigla_uf`, `id_municipio`), garantindo que queries analíticas leiam apenas frações das tabelas e tenham custos mínimos.
+
+### Gold — deployado como Cloud Functions (Gen2)
+
+A orquestração e testes de qualidade da camada Gold também foram expostos como um endpoint HTTP (`gold_transform_http`), permitindo que a camada seja rodada sob demanda de forma serverless e escalável na nuvem.
+
+| Recurso | Nome | Tipo de acionamento | Estado |
+|---|---|---|---|
+| Cloud Function | `gold-transform` | HTTP (chamada via webhook ou Scheduler) | `ACTIVE` |
+
 ## Tecnologias e justificativa
 
 | Componente | Escolha | Por quê |
@@ -128,7 +147,19 @@ A transformação e validação da camada Silver também foram integradas ao `sr
 
 ## Decisões arquiteturais e trade-offs
 
-*(Seção futura — batch vs streaming, data lake vs data warehouse, custo vs performance.)*
+No desenvolvimento desta pipeline híbrida para a pós em AI Scientist, pesamos diversas escolhas estruturais e custos operacionais:
+
+1. **Batch vs. Streaming**:
+   - *Streaming (Pub/Sub + Inserções contínuas)*: Utilizado para simular a chegada rápida de microdados de alunos (`dados_alunos_streaming`). Oferece baixa latência e permite análises quase tempo real, essencial para o acompanhamento dinâmico durante períodos de aplicação de provas.
+   - *Batch (Queries agendadas)*: Utilizado para dados históricos e tabelas de metas que mudam raramente. A abordagem híbrida nos dá o melhor de dois mundos: consistência e custo controlado com processamento em lote diário/mensal para a maior parte do data lake, e agilidade em tempo real nas tabelas de eventos.
+
+2. **Data Lake (GCS) vs. Data Warehouse (BigQuery)**:
+   - Mantemos o armazenamento dos dados originais no GCS em sua forma bruta (Bronze/Raw) garantindo a rastreabilidade e a possibilidade de reprocessar toda a história caso surjam novos requerimentos.
+   - O BigQuery é usado como Lakehouse, onde residem os esquemas estruturados. Graças à separação física entre armazenamento (barato) e poder de computação (pago sob demanda), podemos manter a arquitetura medalhão com custos reduzidos.
+
+3. **Custo vs. Performance (FinOps)**:
+   - Em vez de usar ferramentas com clusters sempre ativos (como Spark ou Airflow), optamos por Cloud Functions que escalam a zero quando não estão processando.
+   - Toda a transformação pesada da Silver e Gold ocorre *in-database* no BigQuery via SQL declarativo de alto desempenho, maximizando a eficiência de rede e tirando proveito da arquitetura distribuída do Google.
 
 ## Qualidade de dados
 
@@ -142,11 +173,27 @@ A camada Silver inclui um pipeline de qualidade de dados (`src/quality/data_qual
 
 ## Monitoramento e FinOps
 
-*(Seção futura.)*
+O pipeline foi desenhado de forma a manter os custos sob controle estrito (FinOps) e garantir observabilidade operacional:
+
+- **Controle de Custos (FinOps)**:
+  - Uso intensivo de **Particionamento por Range** no campo `ano` e **Clusterização** por `sigla_uf` e `id_municipio` em todas as tabelas das camadas Silver e Gold. Queries analíticas que filtram por estas colunas escaneiam apenas as partições/clusters de interesse, reduzindo em até 95% os gigabytes processados.
+  - O uso de Cloud Functions Gen2 assegura que pagamos apenas pelos milissegundos exatos de execução.
+- **Monitoramento e Alertas**:
+  - Toda execução escreve logs estruturados que são enviados automaticamente ao **GCP Cloud Logging**.
+  - A camada de qualidade de dados (`src/quality/data_quality.py`) age como barreira de segurança. Falhas críticas na unicidade de chaves ou integridade de dados param o pipeline imediatamente, prevenindo a poluição de tabelas analíticas secundárias.
+  - Desvios em chaves estrangeiras (municípios inválidos) são automaticamente roteados para tabelas de **Quarentena** e seu volume é reportado como warnings nos logs, permitindo auditorias periódicas sem derrubar o pipeline.
 
 ## Aplicação em IA
 
-*(Seção futura — como a camada Gold pode alimentar modelos preditivos de alfabetização, análises de desigualdade educacional e políticas públicas baseadas em evidências.)*
+Os marts analíticos da camada Gold servem como uma base de dados limpa, integrada e consistente, pronta para treinar modelos estatísticos e preditivos:
+
+1. **Modelos de Predição de Alfabetização**:
+   - Treinamento de algoritmos de classificação e regressão (como Random Forests, XGBoost ou redes neurais simples) usando a `taxa_alfabetizacao_real` histórica e recursos adicionais de infraestrutura para prever a taxa de alfabetização futura de um município ou escola.
+   - Modelagem de risco para identificar municípios propensos a não atingir as metas nacionais do Compromisso Criança Alfabetizada até 2030, permitindo intervenções precoces.
+2. **Análise de Desigualdade Educacional**:
+   - Clusterização (ex.: K-Means) de municípios baseando-se em proficiência média (`media_portugues_real`), redes de ensino (`rede`) e desvios de metas. Isso possibilita agrupar municípios por vulnerabilidade educacional para entender desigualdades regionais e socioeconômicas.
+3. **Políticas Públicas Baseadas em Evidências**:
+   - Com dados geográficos e temporais consolidados na Gold, gestores públicos podem rodar testes de impacto de novas políticas públicas de alfabetização através de técnicas de econometria (como Diferença em Diferenças ou Controle Sintético), comparando municípios tratados com seus respectivos grupos de controle baseados na proximidade de metas.
 
 ## Como rodar
 
@@ -186,6 +233,13 @@ PYTHONPATH=src python -m streaming.producer --limit 500 --rate 20
 PYTHONPATH=src .venv/bin/python3 -m silver.run_silver
 ```
 
+### Camada Gold
+
+```bash
+# Executa transformações e validações de qualidade da Gold localmente
+PYTHONPATH=src .venv/bin/python3 -m gold.run_gold
+```
+
 ### Deploy das Cloud Functions (Bronze)
 
 ```bash
@@ -222,4 +276,13 @@ gcloud functions deploy silver-transform \
   --set-env-vars=GCP_PROJECT_ID=<PROJECT_ID>,BQ_DATASET_BRONZE=bronze,BQ_DATASET_SILVER=silver
 ```
 
-Instruções detalhadas de execução das próximas camadas (Gold) serão adicionadas junto com o respectivo incremento.
+### Deploy das Cloud Functions (Gold)
+
+```bash
+# Função Gold (HTTP, aciona processamento e testes de qualidade da Gold)
+gcloud functions deploy gold-transform \
+  --gen2 --region=southamerica-east1 --runtime=python312 \
+  --source=src --entry-point=gold_transform_http --trigger-http --no-allow-unauthenticated \
+  --memory=512Mi --timeout=300s \
+  --set-env-vars=GCP_PROJECT_ID=<PROJECT_ID>,BQ_DATASET_SILVER=silver,BQ_DATASET_GOLD=gold
+```
