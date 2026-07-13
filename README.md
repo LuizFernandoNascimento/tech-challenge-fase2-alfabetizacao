@@ -2,19 +2,19 @@
 
 Tech Challenge — Fase 2 (POSTECH/FIAP, AI Scientist). Pipeline de dados híbrido (batch + streaming) em nuvem, seguindo Arquitetura Medalhão (Bronze/Silver/Gold), para integrar e disponibilizar o indicador **Criança Alfabetizada** do INEP.
 
-> Status: em construção incremental. Este README é atualizado a cada camada entregue (ver histórico de commits/PRs).
+> Status: Concluído. Este README foi atualizado a cada camada entregue (ver histórico de commits/PRs).
 
 ## Índice
 
 - [Contexto do problema](#contexto-do-problema)
 - [Desafio educacional e o indicador de alfabetização](#desafio-educacional-e-o-indicador-de-alfabetização)
 - [Fontes de dados](#fontes-de-dados)
-- [Arquitetura da solução](#arquitetura-da-solução) *(detalhada progressivamente)*
+- [Arquitetura da solução](#arquitetura-da-solução) 
 - [Tecnologias e justificativa](#tecnologias-e-justificativa)
-- [Decisões arquiteturais e trade-offs](#decisões-arquiteturais-e-trade-offs) *(seção futura)*
-- [Qualidade de dados](#qualidade-de-dados) *(seção futura)*
+- [Decisões arquiteturais e trade-offs](#decisões-arquiteturais-e-trade-offs) 
+- [Qualidade de dados](#qualidade-de-dados) 
 - [Monitoramento e FinOps](#monitoramento-e-finops)
-- [Aplicação em IA](#aplicação-em-ia) *(seção futura)*
+- [Aplicação em IA](#aplicação-em-ia) 
 - [Como rodar](#como-rodar)
 
 ## Contexto do problema
