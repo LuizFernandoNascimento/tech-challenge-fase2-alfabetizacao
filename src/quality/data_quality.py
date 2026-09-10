@@ -117,18 +117,32 @@ class QualityRun:
         if not self.results:
             return
         table_id = ensure_results_table(self.client, self.dataset_quality)
-        errors = self.client.insert_rows_json(table_id, self.results)
-        if errors:
+
+        # Load job, não streaming insert (insert_rows_json). São poucas
+        # dezenas de linhas por rodada, e o load job é gratuito, não
+        # prende as linhas num streaming buffer (que bloquearia
+        # UPDATE/DELETE por ~90min) e deixa o histórico corrigível -
+        # importante para uma tabela de auditoria.
+        job_config = bigquery.LoadJobConfig(
+            schema=RESULTS_SCHEMA,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        try:
+            self.client.load_table_from_json(
+                self.results, table_id, job_config=job_config
+            ).result()
+        except Exception:
             # Não deixamos um problema ao gravar o histórico mascarar o
             # resultado da validação em si - por isso só logamos.
-            logger.error("Erro ao persistir histórico de qualidade: %s", errors)
-        else:
-            logger.info(
-                "Histórico de qualidade gravado em %s (run_id=%s, %d checks)",
-                table_id,
-                self.run_id,
-                len(self.results),
-            )
+            logger.exception("Erro ao persistir histórico de qualidade em %s", table_id)
+            return
+
+        logger.info(
+            "Histórico de qualidade gravado em %s (run_id=%s, %d checks)",
+            table_id,
+            self.run_id,
+            len(self.results),
+        )
 
     def __enter__(self) -> "QualityRun":
         return self

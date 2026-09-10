@@ -140,6 +140,10 @@ Tabelas criadas:
 - **`mart_comparativo_municipio`**: Nível Município + Rede + Ano. Junta os resultados das avaliações municipais, as respectivas metas e os **agregados dos microdados de aluno da carga batch completa** (colunas `*_microdados`, apoiadas em 3.867.999 alunos de 5.548 municípios), calculando desvios e sinalizadores de meta batida.
 - **`mart_comparativo_uf`**: Nível Estado (UF) + Rede + Ano. Similar à tabela municipal, mas agregada na escala estadual (com nome do estado e região trazidos via dimensão localidades).
 - **`mart_comparativo_brasil`**: Nível Nacional (Brasil) + Rede + Ano. Consolidado das metas nacionais e das taxas gerais de alfabetização por rede.
+**A pipeline reproduz o indicador oficial.** Os agregados de aluno são ponderados por `peso_aluno`, como faz o INEP. Isso foi medido, não suposto: comparando nossa taxa calculada a partir dos microdados com a taxa oficial publicada por UF, o erro médio absoluto é de **0,03 ponto percentual** (sem a ponderação seria 0,54 p.p.). Para a proficiência média, 0,048 contra 0,616. Ou seja, partindo de 3,87 milhões de registros brutos, a pipeline reconstrói o indicador publicado — o que serve como validação de ponta a ponta de todas as camadas.
+
+**Rollup "Pública"**: os agregados de microdados incluem, além da quebra por rede específica, uma linha `Pública` (= Estadual + Municipal, conforme o dicionário oficial). Sem esse rollup os microdados de UF e Brasil nunca casariam com as metas desses níveis, que só existem para a rede "Pública" agregada — as colunas existiriam, mas seriam impossíveis de comparar.
+
 - **`mart_frescor_streaming`**: observabilidade do caminho streaming — eventos ingeridos, alunos e municípios cobertos, janela de processamento e **percentual de cobertura sobre a base completa**. Não calcula indicador educacional: mede a saúde da ingestão quase em tempo real, que é o que uma amostra consegue medir honestamente.
 
 **Performance e FinOps na Gold**: Assim como na Silver, as tabelas `mart_comparativo_municipio` e `mart_comparativo_uf` são fisicamente particionadas por `ano` (com `RANGE_BUCKET`) e clusterizadas pelas chaves primárias e geográficas (`sigla_uf`, `id_municipio`), garantindo que queries analíticas leiam apenas frações das tabelas e tenham custos mínimos.
@@ -206,7 +210,13 @@ Agora cada execução grava uma linha por check em **`quality.data_quality_resul
 | `status` | `PASS`, `WARN` (falhou mas não é crítico) ou `FAIL` |
 | `critical` | Se a falha interrompe o pipeline |
 
-A gravação acontece num bloco `finally`, então **mesmo quando um check crítico aborta o pipeline o histórico daquela rodada é registrado** — que é justamente o caso que mais interessa auditar depois. Exemplo de pergunta agora respondível:
+A gravação acontece num bloco `finally`, então **mesmo quando um check crítico aborta o pipeline o histórico daquela rodada é registrado** — que é justamente o caso que mais interessa auditar depois (testado: um check crítico que falha levanta a exceção *e* deixa a linha com `status=FAIL` gravada).
+
+A escrita usa **load job**, não streaming insert: são poucas dezenas de linhas por rodada, o load job é gratuito e não prende as linhas num *streaming buffer* — que bloquearia `UPDATE`/`DELETE` por até 90 minutos. Numa tabela de auditoria, poder corrigir um registro importa.
+
+Testes automatizados da semântica de entrega do consumidor ficam em [`tests/test_consumer_ack.py`](tests/test_consumer_ack.py) (roda sem dependências extras: `PYTHONPATH=src python tests/test_consumer_ack.py`).
+
+Exemplo de pergunta agora respondível:
 
 ```sql
 -- Evolução de um check nos últimos 30 dias

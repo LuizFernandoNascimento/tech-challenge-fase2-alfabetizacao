@@ -33,6 +33,44 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+def flush_batch(bq_client, table_id: str, pending: list) -> int:
+    """Grava um micro-lote e só então confirma as mensagens.
+
+    Recebe uma lista de tuplas (linha, mensagem). Retorna quantas linhas
+    foram efetivamente gravadas - 0 quando o lote foi devolvido.
+
+    Função de módulo (e não closure dentro de run) justamente para poder
+    ser testada de forma isolada, inclusive nos caminhos de erro: é ali
+    que mora a diferença entre perder e duplicar dado.
+    """
+    if not pending:
+        return 0
+
+    rows = [row for row, _ in pending]
+    messages = [message for _, message in pending]
+
+    try:
+        errors = bq_client.insert_rows_json(table_id, rows)
+    except Exception:
+        # Falha de rede/API: não há confirmação de que algo foi gravado,
+        # então devolvemos tudo para o Pub/Sub reentregar.
+        logger.exception("Erro ao chamar o BigQuery; devolvendo %d mensagens", len(messages))
+        for message in messages:
+            message.nack()
+        return 0
+
+    if errors:
+        logger.error("Erros ao inserir no BigQuery: %s", errors)
+        for message in messages:
+            message.nack()
+        return 0
+
+    # Gravação confirmada - só agora é seguro dar ack.
+    for message in messages:
+        message.ack()
+    return len(rows)
+
+
 def run(max_messages: int, batch_window_seconds: float) -> None:
     settings = load_settings()
     bq_client = bigquery.Client(project=settings.project_id)
@@ -50,34 +88,11 @@ def run(max_messages: int, batch_window_seconds: float) -> None:
 
     def flush():
         nonlocal buffer, total_inserted
-        if not buffer:
-            return
-
         pending, buffer = buffer, []
-        rows = [row for row, _ in pending]
-        messages = [message for _, message in pending]
-
-        try:
-            errors = bq_client.insert_rows_json(table_id, rows)
-        except Exception:
-            # Falha de rede/API: nada foi gravado com certeza, então
-            # devolvemos tudo para o Pub/Sub reentregar.
-            logger.exception("Erro ao chamar o BigQuery; devolvendo %d mensagens", len(messages))
-            for message in messages:
-                message.nack()
-            return
-
-        if errors:
-            logger.error("Erros ao inserir no BigQuery: %s", errors)
-            for message in messages:
-                message.nack()
-            return
-
-        # Gravação confirmada - só agora é seguro dar ack.
-        for message in messages:
-            message.ack()
-        total_inserted += len(rows)
-        logger.info("Micro-lote gravado: %d linhas (total %d)", len(rows), total_inserted)
+        inserted = flush_batch(bq_client, table_id, pending)
+        if inserted:
+            total_inserted += inserted
+            logger.info("Micro-lote gravado: %d linhas (total %d)", inserted, total_inserted)
 
     def callback(message):
         row = json.loads(message.data.decode("utf-8"))

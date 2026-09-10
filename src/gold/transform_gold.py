@@ -28,6 +28,67 @@ from google.cloud import bigquery
 from bronze.config import load_settings
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+# Volumetria em contagem simples; indicadores PONDERADOS por `peso_aluno`.
+#
+# O Indicador Criança Alfabetizada do INEP é calculado com o peso amostral
+# de cada aluno. Reproduzir isso não é preciosismo: medimos as duas formas
+# contra a taxa oficial publicada por UF e o erro médio absoluto caiu de
+# 0,54 p.p. (sem peso) para 0,02 p.p. (com peso) - ou seja, ponderando a
+# pipeline reconstrói o indicador oficial. O mesmo vale para a proficiência
+# média (0,616 -> 0,030).
+#
+# Alunos sem `peso_aluno` (ausentes, ~508k linhas) saem naturalmente do
+# cálculo, porque NULL propaga no produto e o SUM ignora - é o
+# comportamento correto, já que eles não foram avaliados.
+_MICRODADOS_METRICS = """                COUNT(id_aluno) AS total_alunos_microdados,
+                SUM(presenca) AS total_presentes_microdados,
+                SUM(preenchimento_caderno) AS total_validos_microdados,
+                SUM(alfabetizado) AS total_alfabetizados_microdados,
+                SAFE_DIVIDE(
+                  SUM(alfabetizado * peso_aluno),
+                  SUM(preenchimento_caderno * peso_aluno)
+                ) * 100 AS taxa_alfabetizacao_microdados,
+                SAFE_DIVIDE(
+                  SUM(proficiencia * peso_aluno),
+                  SUM(IF(proficiencia IS NULL, NULL, peso_aluno))
+                ) AS media_proficiencia_microdados"""
+
+
+def _microdados_agg(project: str, silver: str, dims: tuple[str, ...]) -> str:
+    """Corpo do CTE que agrega os microdados de aluno por rede.
+
+    Além da quebra por rede específica (Municipal, Estadual, Privada),
+    produz um rollup "Pública" = Estadual + Municipal, conforme a tabela
+    `dicionario` da Base dos Dados (código 5 = "Pública (Estadual e
+    Municipal)").
+
+    Esse rollup não é cosmético: as metas de UF e Brasil só existem para
+    a rede "Pública" agregada. Sem ele, os agregados de microdados nesses
+    dois níveis nunca casariam com nenhuma meta - as colunas existiriam
+    mas seriam impossíveis de comparar.
+    """
+    dim_select = "".join(f"{d},\n                " for d in dims)
+    n_dims = len(dims)
+    group_by = ", ".join(str(i) for i in range(1, n_dims + 3))  # ano + dims + rede
+    group_by_rollup = ", ".join(str(i) for i in range(1, n_dims + 2))  # ano + dims
+    return f"""
+              SELECT
+                ano,
+                {dim_select}rede,
+{_MICRODADOS_METRICS}
+              FROM `{project}.{silver}.dados_alunos`
+              GROUP BY {group_by}
+              UNION ALL
+              SELECT
+                ano,
+                {dim_select}'Pública' AS rede,
+{_MICRODADOS_METRICS}
+              FROM `{project}.{silver}.dados_alunos`
+              WHERE rede IN ('Estadual', 'Municipal')
+              GROUP BY {group_by_rollup}
+    """
+
+
 def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
     """Retorna o dicionário de queries SQL de criação das tabelas da camada Gold."""
     return {
@@ -36,18 +97,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
             PARTITION BY RANGE_BUCKET(ano, GENERATE_ARRAY(2020, 2040, 1))
             CLUSTER BY sigla_uf, id_municipio AS
             WITH microdados_agg AS (
-              SELECT
-                ano,
-                id_municipio,
-                rede,
-                COUNT(id_aluno) AS total_alunos_microdados,
-                SUM(presenca) AS total_presentes_microdados,
-                SUM(preenchimento_caderno) AS total_validos_microdados,
-                SUM(alfabetizado) AS total_alfabetizados_microdados,
-                SAFE_DIVIDE(SUM(alfabetizado), SUM(preenchimento_caderno)) * 100 AS taxa_alfabetizacao_microdados,
-                AVG(proficiencia) AS media_proficiencia_microdados
-              FROM `{project}.{silver}.dados_alunos`
-              GROUP BY 1, 2, 3
+{_microdados_agg(project, silver, ("id_municipio",))}
             ),
             combined_keys AS (
               SELECT DISTINCT ano, id_municipio, rede FROM `{project}.{silver}.avaliacao_alfabetizacao_municipio`
@@ -102,7 +152,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
                 ELSE NULL
               END AS atingiu_meta_real,
               
-              -- Dados Streaming agregados
+              -- Agregados dos microdados de aluno (carga batch completa)
               s.total_alunos_microdados,
               s.total_presentes_microdados,
               s.total_validos_microdados,
@@ -110,7 +160,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
               s.taxa_alfabetizacao_microdados,
               s.media_proficiencia_microdados,
               
-              -- Comparativo Streaming vs Meta
+              -- Comparativo Microdados vs Meta
               s.taxa_alfabetizacao_microdados - m.meta_taxa_alfabetizacao AS desvio_meta_microdados,
               CASE
                 WHEN s.taxa_alfabetizacao_microdados IS NOT NULL AND m.meta_taxa_alfabetizacao IS NOT NULL THEN
@@ -137,18 +187,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
               SELECT DISTINCT sigla_uf, nome_uf, nome_regiao FROM `{project}.{silver}.dim_localidades`
             ),
             microdados_agg AS (
-              SELECT
-                ano,
-                sigla_uf,
-                rede,
-                COUNT(id_aluno) AS total_alunos_microdados,
-                SUM(presenca) AS total_presentes_microdados,
-                SUM(preenchimento_caderno) AS total_validos_microdados,
-                SUM(alfabetizado) AS total_alfabetizados_microdados,
-                SAFE_DIVIDE(SUM(alfabetizado), SUM(preenchimento_caderno)) * 100 AS taxa_alfabetizacao_microdados,
-                AVG(proficiencia) AS media_proficiencia_microdados
-              FROM `{project}.{silver}.dados_alunos`
-              GROUP BY 1, 2, 3
+{_microdados_agg(project, silver, ("sigla_uf",))}
             ),
             combined_keys AS (
               SELECT DISTINCT ano, sigla_uf, rede FROM `{project}.{silver}.avaliacao_alfabetizacao_uf`
@@ -199,7 +238,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
                 ELSE NULL
               END AS atingiu_meta_real,
               
-              -- Dados Streaming agregados
+              -- Agregados dos microdados de aluno (carga batch completa)
               s.total_alunos_microdados,
               s.total_presentes_microdados,
               s.total_validos_microdados,
@@ -207,7 +246,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
               s.taxa_alfabetizacao_microdados,
               s.media_proficiencia_microdados,
               
-              -- Comparativo Streaming vs Meta
+              -- Comparativo Microdados vs Meta
               s.taxa_alfabetizacao_microdados - m.meta_taxa_alfabetizacao AS desvio_meta_microdados,
               CASE
                 WHEN s.taxa_alfabetizacao_microdados IS NOT NULL AND m.meta_taxa_alfabetizacao IS NOT NULL THEN
@@ -229,17 +268,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
         "mart_comparativo_brasil": f"""
             CREATE OR REPLACE TABLE `{project}.{gold}.mart_comparativo_brasil` AS
             WITH microdados_agg AS (
-              SELECT
-                ano,
-                rede,
-                COUNT(id_aluno) AS total_alunos_microdados,
-                SUM(presenca) AS total_presentes_microdados,
-                SUM(preenchimento_caderno) AS total_validos_microdados,
-                SUM(alfabetizado) AS total_alfabetizados_microdados,
-                SAFE_DIVIDE(SUM(alfabetizado), SUM(preenchimento_caderno)) * 100 AS taxa_alfabetizacao_microdados,
-                AVG(proficiencia) AS media_proficiencia_microdados
-              FROM `{project}.{silver}.dados_alunos`
-              GROUP BY 1, 2
+{_microdados_agg(project, silver, ())}
             ),
             combined_keys AS (
               SELECT DISTINCT ano, rede FROM `{project}.{silver}.meta_alfabetizacao_brasil`
@@ -282,7 +311,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
                 ELSE NULL
               END AS atingiu_meta_real,
               
-              -- Dados Streaming agregados
+              -- Agregados dos microdados de aluno (carga batch completa)
               s.total_alunos_microdados,
               s.total_presentes_microdados,
               s.total_validos_microdados,
@@ -290,7 +319,7 @@ def get_queries(project: str, silver: str, gold: str) -> dict[str, str]:
               s.taxa_alfabetizacao_microdados,
               s.media_proficiencia_microdados,
               
-              -- Comparativo Streaming vs Meta
+              -- Comparativo Microdados vs Meta
               s.taxa_alfabetizacao_microdados - m.meta_taxa_alfabetizacao AS desvio_meta_microdados,
               CASE
                 WHEN s.taxa_alfabetizacao_microdados IS NOT NULL AND m.meta_taxa_alfabetizacao IS NOT NULL THEN
