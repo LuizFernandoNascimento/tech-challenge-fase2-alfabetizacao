@@ -26,6 +26,13 @@ def batch_ingest_http(request):
     return ("Ingestão batch concluída", 200)
 @functions_framework.cloud_event
 def streaming_consumer_pubsub(event: CloudEvent):
+    # Semântica de entrega: numa Cloud Function acionada por Pub/Sub o
+    # ack é implícito - retornar sem exceção confirma a mensagem, e
+    # levantar exceção faz o Pub/Sub reentregar. Como o insert acontece
+    # antes do retorno e qualquer erro vira exceção, a mensagem só é
+    # confirmada depois da gravação (at-least-once, igual ao consumidor
+    # local em streaming/consumer.py). Duplicidade é tratada pela
+    # deduplicação da Silver; perder microdado não seria recuperável.
     settings = load_settings()
     bq_client = bigquery.Client(project=settings.project_id)
     table_id = ensure_streaming_table(bq_client, settings.dataset_bronze)

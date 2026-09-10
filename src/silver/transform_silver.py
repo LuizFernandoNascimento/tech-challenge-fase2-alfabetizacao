@@ -66,6 +66,7 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
     meta_municipio = _latest_snapshot(project, bronze, "meta_alfabetizacao_municipio")
     avaliacao_uf = _latest_snapshot(project, bronze, "avaliacao_alfabetizacao_uf")
     avaliacao_municipio = _latest_snapshot(project, bronze, "avaliacao_alfabetizacao_municipio")
+    alunos_batch = _latest_snapshot(project, bronze, "dados_alunos")
 
     return {
         "dim_localidades": f"""
@@ -215,10 +216,86 @@ def get_queries(project: str, bronze: str, silver: str) -> dict[str, str]:
               ON LPAD(CAST(m.id_municipio AS STRING), 7, '0') = loc.id_municipio
             WHERE loc.id_municipio IS NULL
         """,
+        # dados_alunos: os microdados COMPLETOS (~3,87M linhas), vindos
+        # da carga batch. Esta é a tabela autoritativa de aluno - é dela
+        # que a Gold calcula o indicador de alfabetização. Como a Bronze
+        # é append-only e cada execução grava um snapshot inteiro, aqui
+        # vale o _latest_snapshot (diferente da tabela de streaming, em
+        # que cada linha é um evento independente).
+        "dados_alunos": f"""
+            CREATE OR REPLACE TABLE `{project}.{silver}.dados_alunos`
+            PARTITION BY RANGE_BUCKET(ano, GENERATE_ARRAY(2020, 2040, 1))
+            CLUSTER BY sigla_uf, id_municipio AS
+            WITH RankedAlunos AS (
+              SELECT
+                CAST(ano AS INT64) AS ano,
+                LPAD(CAST(id_municipio AS STRING), 7, '0') AS id_municipio,
+                TRIM(id_escola) AS id_escola,
+                TRIM(id_aluno) AS id_aluno,
+                CAST(caderno AS INT64) AS caderno,
+                CAST(serie AS INT64) AS serie,
+                -- Na carga batch, `rede` vem como STRING direto da fonte
+                -- (no caminho streaming o coerce_row já converte para
+                -- INT64), por isso o CAST explícito antes do mapeamento.
+                {_rede_label_case("CAST(rede AS INT64)")} AS rede,
+                CAST(presenca AS INT64) AS presenca,
+                CAST(preenchimento_caderno AS INT64) AS preenchimento_caderno,
+                CAST(alfabetizado AS INT64) AS alfabetizado,
+                CAST(proficiencia AS FLOAT64) AS proficiencia,
+                CAST(peso_aluno AS FLOAT64) AS peso_aluno,
+                ROW_NUMBER() OVER (
+                  PARTITION BY id_aluno, ano
+                  ORDER BY _ingested_at DESC
+                ) as rn
+              FROM {alunos_batch}
+            )
+            SELECT
+              a.ano,
+              a.id_municipio,
+              loc.sigla_uf AS sigla_uf,
+              a.id_escola,
+              a.id_aluno,
+              a.caderno,
+              a.serie,
+              a.rede,
+              a.presenca,
+              a.preenchimento_caderno,
+              a.alfabetizado,
+              a.proficiencia,
+              a.peso_aluno,
+              CURRENT_TIMESTAMP() AS _processed_at
+            FROM RankedAlunos a
+            INNER JOIN `{project}.{silver}.dim_localidades` loc
+              ON a.id_municipio = loc.id_municipio
+            WHERE a.rn = 1
+        """,
+        "quarentena_dados_alunos": f"""
+            CREATE OR REPLACE TABLE `{project}.{silver}.quarentena_dados_alunos` AS
+            WITH RankedAlunos AS (
+              SELECT
+                *,
+                LPAD(CAST(id_municipio AS STRING), 7, '0') AS id_municipio_padded,
+                ROW_NUMBER() OVER (
+                  PARTITION BY id_aluno, ano
+                  ORDER BY _ingested_at DESC
+                ) as rn
+              FROM {alunos_batch}
+            )
+            SELECT
+              a.* EXCEPT(id_municipio_padded, rn),
+              'id_municipio não encontrado em dim_localidades' AS _motivo_quarentena,
+              CURRENT_TIMESTAMP() AS _quarantined_at
+            FROM RankedAlunos a
+            LEFT JOIN `{project}.{silver}.dim_localidades` loc
+              ON a.id_municipio_padded = loc.id_municipio
+            WHERE a.rn = 1 AND loc.id_municipio IS NULL
+        """,
         # dados_alunos_streaming: cada linha na Bronze já é um evento
         # individual (não um snapshot completo), então aqui não se
         # aplica _latest_snapshot - a deduplicação por id_aluno/ano
         # continua sendo o que decide qual versão do evento vale.
+        # Esta tabela mede FRESCOR do caminho streaming; o indicador
+        # de alfabetização sai de `dados_alunos` (carga completa).
         "dados_alunos_streaming": f"""
             CREATE OR REPLACE TABLE `{project}.{silver}.dados_alunos_streaming`
             PARTITION BY RANGE_BUCKET(ano, GENERATE_ARRAY(2020, 2040, 1))
@@ -304,6 +381,8 @@ def execute_transformations() -> None:
         "avaliacao_alfabetizacao_uf",
         "avaliacao_alfabetizacao_municipio",
         "quarentena_avaliacao_alfabetizacao_municipio",
+        "dados_alunos",
+        "quarentena_dados_alunos",
         "dados_alunos_streaming",
         "quarentena_dados_alunos_streaming",
     ]

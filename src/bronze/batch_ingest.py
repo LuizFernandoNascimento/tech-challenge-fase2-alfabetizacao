@@ -1,10 +1,15 @@
 """Ingestão batch da camada Bronze.
 
-Duas origens diferentes:
-- As 5 fontes do INEP (metas + resultados) e os microdados de aluno já
-  existem como tabelas BigQuery públicas da Base dos Dados (projeto
-  `basedosdados`) - carregadas via consulta cross-project, sem baixar
-  CSV nem passar pelo GCS.
+Três origens diferentes:
+- As 5 fontes agregadas do INEP (metas + resultados) existem como
+  tabelas BigQuery públicas da Base dos Dados (projeto `basedosdados`)
+  e são pequenas (até ~24k linhas) - carregadas via consulta
+  cross-project trazendo as linhas para o processo, sem baixar CSV.
+- Os **microdados de aluno** (~3,87 milhões de linhas) vêm da mesma
+  fonte pública, mas são grandes demais para passar pelo processo
+  Python. Usam um caminho próprio, todo server-side: CTAS na
+  multi-região US + cópia cross-region para a Bronze. Ver
+  load_large_table_from_basedosdados().
 - A dimensão IBGE (município/UF) não tem tabela pública equivalente,
   então continua vindo de um CSV (bronze/ibge_reference.py) subido ao
   nosso próprio bucket.
@@ -30,6 +35,7 @@ from bronze.sources import (
     BASEDOSDADOS_DATASET,
     BASEDOSDADOS_PROJECT,
     BD_BATCH_SOURCES,
+    BD_LARGE_BATCH_SOURCES,
     IBGE_REFERENCE_SOURCE,
     BasedosdadosSource,
     BronzeSource,
@@ -71,6 +77,88 @@ def load_from_basedosdados(bq_client: bigquery.Client, dataset_id: str, source: 
         source_table,
         final_table_id,
         len(rows),
+        table.num_rows,
+    )
+
+
+def _table_exists(bq_client: bigquery.Client, table_id: str) -> bool:
+    from google.api_core.exceptions import NotFound
+
+    try:
+        bq_client.get_table(table_id)
+        return True
+    except NotFound:
+        return False
+
+
+def load_large_table_from_basedosdados(
+    bq_client: bigquery.Client, dataset_id: str, staging_dataset_us: str, source: BasedosdadosSource
+) -> None:
+    """Carrega uma tabela grande da Base dos Dados sem passar pelo processo.
+
+    Os microdados de aluno têm ~3,87 milhões de linhas: trazer isso para
+    a memória do Python (como faz load_from_basedosdados) seria lento e
+    caro. Aqui tudo acontece server-side, em três etapas:
+
+    1. CTAS na multi-região US, materializando a fonte pública numa
+       tabela de staging no NOSSO projeto (mesma location, então o
+       BigQuery aceita o job) - leva poucos segundos.
+    2. Cópia cross-region da staging (US) para uma tabela de landing na
+       nossa região. A cópia precisa ser WRITE_TRUNCATE: o BigQuery
+       **não permite append em cópia cross-region** ("Cross-region table
+       copy with append mode is unsupported"), por isso a landing existe.
+    3. INSERT ... SELECT da landing para a Bronze final. Esse job é
+       same-region, então aceita append - e é assim que preservamos o
+       histórico de snapshots exigido da Bronze.
+
+    As duas tabelas intermediárias são descartadas no fim: são só os
+    degraus que resolvem a diferença de location entre a fonte pública e
+    o nosso data warehouse.
+    """
+    source_table = f"{BASEDOSDADOS_PROJECT}.{BASEDOSDADOS_DATASET}.{source.bd_table}"
+    staging_table_id = f"{bq_client.project}.{staging_dataset_us}.{source.table_name}_stg"
+    landing_table_id = f"{bq_client.project}.{dataset_id}.{source.table_name}_landing"
+    final_table_id = f"{bq_client.project}.{dataset_id}.{source.table_name}"
+
+    # Etapa 1 - CTAS server-side em US (nada trafega pelo processo).
+    ctas = f"""
+        CREATE OR REPLACE TABLE `{staging_table_id}` AS
+        SELECT *, CURRENT_TIMESTAMP() AS _ingested_at, @source_table AS _source_file
+        FROM `{source_table}`
+    """
+    ctas_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("source_table", "STRING", source_table)]
+    )
+    bq_client.query(ctas, job_config=ctas_config, location="US").result()
+    staging = bq_client.get_table(staging_table_id)
+    logger.info("Staging US materializada: %s (%d linhas)", staging_table_id, staging.num_rows)
+
+    # Etapa 2 - cópia cross-region para a landing (truncate obrigatório).
+    copy_config = bigquery.CopyJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+    )
+    bq_client.copy_table(staging_table_id, landing_table_id, job_config=copy_config).result()
+
+    # Etapa 3 - append same-region da landing para a Bronze definitiva.
+    # Na primeira execução a tabela final ainda não existe, então o
+    # INSERT falharia - nesse caso criamos a partir da landing.
+    if _table_exists(bq_client, final_table_id):
+        sql = f"INSERT INTO `{final_table_id}` SELECT * FROM `{landing_table_id}`"
+    else:
+        sql = f"CREATE TABLE `{final_table_id}` AS SELECT * FROM `{landing_table_id}`"
+    bq_client.query(sql).result()
+
+    # Etapa 4 - as intermediárias já cumpriram o papel; não vale pagar storage.
+    bq_client.delete_table(staging_table_id, not_found_ok=True)
+    bq_client.delete_table(landing_table_id, not_found_ok=True)
+
+    table = bq_client.get_table(final_table_id)
+    logger.info(
+        "Bronze carregada de %s: %s (snapshot com %d linhas, %d linhas no total acumulado)",
+        source_table,
+        final_table_id,
+        staging.num_rows,
         table.num_rows,
     )
 
@@ -132,13 +220,19 @@ def load_csv_to_bigquery(bq_client: bigquery.Client, dataset_id: str, gcs_uri: s
 
 def run() -> None:
     """Bootstrap local: tabelas do INEP direto do BigQuery público da
-    Base dos Dados + dimensão IBGE via CSV (upload + load).
+    Base dos Dados (agregadas + microdados de aluno) + dimensão IBGE
+    via CSV (upload + load).
     """
     settings = load_settings()
     bq_client = bigquery.Client(project=settings.project_id)
 
     for source in BD_BATCH_SOURCES:
         load_from_basedosdados(bq_client, settings.dataset_bronze, source)
+
+    for source in BD_LARGE_BATCH_SOURCES:
+        load_large_table_from_basedosdados(
+            bq_client, settings.dataset_bronze, settings.dataset_bronze_us, source
+        )
 
     storage_client = storage.Client(project=settings.project_id)
     gcs_uri = upload_to_gcs(storage_client, settings.bucket_raw, IBGE_REFERENCE_SOURCE)
@@ -159,6 +253,11 @@ def reload_bronze_from_gcs() -> None:
 
     for source in BD_BATCH_SOURCES:
         load_from_basedosdados(bq_client, settings.dataset_bronze, source)
+
+    for source in BD_LARGE_BATCH_SOURCES:
+        load_large_table_from_basedosdados(
+            bq_client, settings.dataset_bronze, settings.dataset_bronze_us, source
+        )
 
     gcs_uri = _gcs_uri(settings.bucket_raw, IBGE_REFERENCE_SOURCE)
     load_csv_to_bigquery(bq_client, settings.dataset_bronze, gcs_uri, IBGE_REFERENCE_SOURCE)

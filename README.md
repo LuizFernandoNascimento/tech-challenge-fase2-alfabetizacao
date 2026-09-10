@@ -37,7 +37,8 @@ A Base dos Dados já publica esse dataset como tabelas **BigQuery públicas** (p
 
 | Entidade | Tabela de origem (`basedosdados.br_inep_avaliacao_alfabetizacao.*`) | Volume |
 |---|---|---|
-| Dados de alunos (microdados) | `alunos` | ~3,87M linhas |
+| Dados de alunos (microdados) — carga batch completa | `alunos` | 3.867.999 linhas |
+| Dados de alunos (microdados) — replay streaming | `alunos` (mesma fonte, amostrada) | amostra controlada pelo produtor |
 | Meta Alfabetização Brasil | `meta_alfabetizacao_brasil` | 3 linhas |
 | Meta Alfabetização UF | `meta_alfabetizacao_uf` | 81 linhas |
 | Meta Alfabetização Município | `meta_alfabetizacao_municipio` | ~10,7k linhas |
@@ -55,7 +56,7 @@ Visão geral adotada:
 - **Data Lake**: Google Cloud Storage (bucket `tech-challenge-alfabetiza-25-raw`, prefixo `bronze/<tabela>/<arquivo>`).
 - **Data Warehouse / Lakehouse analítico**: BigQuery, com datasets separados `bronze`, `silver`, `gold` — particionamento por `ano` e clusterização por `sigla_uf`/`id_municipio` planejados a partir da camada Silver.
 - **Ingestão batch** ([`src/bronze/batch_ingest.py`](src/bronze/batch_ingest.py)): as 5 tabelas de metas/resultados são lidas direto das tabelas públicas da Base dos Dados no BigQuery (`basedosdados.br_inep_avaliacao_alfabetizacao.*`) e gravadas na nossa Bronze com `_ingested_at`/`_source_file`; a dimensão IBGE continua vindo de CSV -> GCS -> BigQuery, já que não existe tabela pública equivalente. **A Bronze é append-only**: cada execução acrescenta um novo snapshot (identificado por `_ingested_at`) em vez de sobrescrever o anterior, preservando o histórico completo — quem lê a Bronze depois (a Silver) é responsável por filtrar o snapshot mais recente quando quiser o estado atual.
-- **Ingestão streaming (simulada)** ([`src/streaming/producer.py`](src/streaming/producer.py) + [`src/streaming/consumer.py`](src/streaming/consumer.py)): um produtor consulta a tabela pública `alunos` no BigQuery e replaya as linhas como mensagens Pub/Sub, a uma taxa controlada; um consumidor faz *pull* das mensagens, acumula micro-lotes e grava via streaming insert na tabela `bronze.dados_alunos_streaming`.
+- **Ingestão streaming (simulada)** ([`src/streaming/producer.py`](src/streaming/producer.py) + [`src/streaming/consumer.py`](src/streaming/consumer.py)): um produtor consulta a tabela pública `alunos` no BigQuery e replaya as linhas como mensagens Pub/Sub, a uma taxa controlada; um consumidor faz *pull* das mensagens, acumula micro-lotes e grava via streaming insert na tabela `bronze.dados_alunos_streaming`. **Semântica de entrega**: o `ack` só é enviado *depois* de o BigQuery confirmar a gravação (e um `nack` explícito devolve o lote em caso de erro). Assim o pipeline é *at-least-once*: numa falha pode haver duplicidade — tratada pela deduplicação da Silver —, mas nunca perda silenciosa de microdado. Na Cloud Function equivalente (`main.py::streaming_consumer_pubsub`) a garantia é a mesma, já que o ack é implícito no retorno sem exceção.
 - **Dimensão de referência** ([`src/bronze/ibge_reference.py`](src/bronze/ibge_reference.py)): busca nome de UF/município/região na API pública do IBGE, já que nenhuma fonte do INEP traz esses atributos — apenas códigos.
 - **Provisionamento de infraestrutura** ([`src/bronze/setup_infra.py`](src/bronze/setup_infra.py)): script idempotente que cria bucket, datasets e tópico/assinatura Pub/Sub via `google-cloud-*` (sem Terraform, dado o tamanho do projeto).
 - **Camadas**: Bronze (dados brutos, sem transformação) → Silver (limpeza, padronização, normalização de chaves, integração/dimensões, validação de qualidade) → Gold (marts analíticos prontos para BI/ML).
@@ -72,7 +73,23 @@ Rodado contra o projeto GCP real:
 | `avaliacao_alfabetizacao_uf` | 145 |
 | `avaliacao_alfabetizacao_municipio` | 23.995 |
 | `ibge_municipios` | 5.571 |
-| `dados_alunos_streaming` (via Pub/Sub, amostra de teste) | 1.126+ eventos (190 alunos distintos na primeira rodada) |
+| `dados_alunos` (carga batch completa dos microdados) | **3.867.999** (5.548 municípios) |
+| `dados_alunos_streaming` (via Pub/Sub, amostra de replay) | ~1,2k eventos acumulados |
+
+#### Os microdados de aluno chegam por dois caminhos — e eles não servem para a mesma coisa
+
+Esta é a distinção mais importante da arquitetura, e vale explicitar:
+
+| | `dados_alunos` (BATCH) | `dados_alunos_streaming` (STREAMING) |
+|---|---|---|
+| Volume | **3.867.999 linhas — a base completa** | Amostra (o produtor decide quantos eventos replaya) |
+| Cobertura | 5.548 municípios | ~0,004% da base (ver `gold.mart_frescor_streaming`) |
+| Para que serve | **Fonte autoritativa**: todo indicador de alfabetização por município/UF/Brasil na Gold sai daqui (colunas `*_microdados`) | Exercitar e medir o caminho quase em tempo real: volume ingerido, cobertura e latência |
+| Onde aparece na Gold | `mart_comparativo_municipio/uf/brasil` | `mart_frescor_streaming` |
+
+Por que a separação importa: calcular taxa de alfabetização municipal a partir da amostra de streaming produziria um indicador **não representativo** — poucas centenas de alunos espalhados por município não sustentam uma taxa. A carga batch existe justamente para que o indicador seja calculado sobre a população inteira, enquanto o streaming continua provando o caminho híbrido exigido pelo desafio, medindo o que ele de fato consegue medir.
+
+**Como os 3,87M chegam até a nossa região**: a tabela pública vive na multi-região `US` e o BigQuery não aceita um job que referencie tabelas de locations diferentes. Trazer 3,87M linhas pela memória do Python seria lento e caro, então o caminho é todo server-side (ver `bronze/batch_ingest.py::load_large_table_from_basedosdados`): CTAS em `US` → cópia cross-region para uma landing em `southamerica-east1` → `INSERT ... SELECT` same-region na Bronze (append). O degrau da landing existe porque **cópia cross-region não suporta modo append** — só truncate; o append acontece no passo seguinte, já dentro da nossa região.
 
 **Achado relevante nº 1**: na simulação streaming, o número de linhas gravadas superou o de alunos distintos publicados — o Pub/Sub garante *at-least-once delivery*, então mensagens podem ser reentregues e gravadas mais de uma vez. Isso é esperado e **correto** para a Bronze (que preserva os dados brutos exatamente como chegaram, duplicados inclusive); a deduplicação é responsabilidade da camada Silver.
 
@@ -117,12 +134,13 @@ A transformação e validação da camada Silver também foram integradas ao `sr
 
 ### Gold — Camada Analítica e Comparativa (Marts)
 
-A camada Gold consome as tabelas consolidadas da camada Silver para produzir datasets prontos para BI (dashboards), análises estatísticas e modelos de IA/ML. O foco está na comparação entre metas e resultados observados, unificando dados históricos e dados em streaming quase tempo real.
+A camada Gold consome as tabelas consolidadas da camada Silver para produzir datasets prontos para BI (dashboards), análises estatísticas e modelos de IA/ML. O foco está na comparação entre metas e resultados observados.
 
 Tabelas criadas:
-- **`mart_comparativo_municipio`**: Nível Município + Rede + Ano. Consolidado que junta os resultados das avaliações municipais da Silver, as respectivas metas e os dados de streaming de alunos agregados por município, calculando desvios e sinalizadores se a meta foi batida.
+- **`mart_comparativo_municipio`**: Nível Município + Rede + Ano. Junta os resultados das avaliações municipais, as respectivas metas e os **agregados dos microdados de aluno da carga batch completa** (colunas `*_microdados`, apoiadas em 3.867.999 alunos de 5.548 municípios), calculando desvios e sinalizadores de meta batida.
 - **`mart_comparativo_uf`**: Nível Estado (UF) + Rede + Ano. Similar à tabela municipal, mas agregada na escala estadual (com nome do estado e região trazidos via dimensão localidades).
-- **`mart_comparativo_brasil`**: Nível Nacional (Brasil) + Rede + Ano. Consolidado das metas nacionais e das taxas gerais de alfabetização por rede, incluindo agregação nacional do fluxo streaming.
+- **`mart_comparativo_brasil`**: Nível Nacional (Brasil) + Rede + Ano. Consolidado das metas nacionais e das taxas gerais de alfabetização por rede.
+- **`mart_frescor_streaming`**: observabilidade do caminho streaming — eventos ingeridos, alunos e municípios cobertos, janela de processamento e **percentual de cobertura sobre a base completa**. Não calcula indicador educacional: mede a saúde da ingestão quase em tempo real, que é o que uma amostra consegue medir honestamente.
 
 **Performance e FinOps na Gold**: Assim como na Silver, as tabelas `mart_comparativo_municipio` e `mart_comparativo_uf` são fisicamente particionadas por `ano` (com `RANGE_BUCKET`) e clusterizadas pelas chaves primárias e geográficas (`sigla_uf`, `id_municipio`), garantindo que queries analíticas leiam apenas frações das tabelas e tenham custos mínimos.
 
@@ -165,11 +183,39 @@ No desenvolvimento desta pipeline híbrida para a pós em AI Scientist, pesamos 
 
 A camada Silver inclui um pipeline de qualidade de dados (`src/quality/data_quality.py`) que valida a consistência de todas as tabelas após o processamento no BigQuery:
 
-- **Unicidade de Chaves**: Valida chaves primárias únicas (`id_municipio` em `dim_localidades`, `id_aluno + ano` em `dados_alunos_streaming`, `ano + sigla_uf + rede` em `meta_alfabetizacao_uf`).
+- **Unicidade de Chaves**: Valida chaves primárias únicas (`id_municipio` em `dim_localidades`, `id_aluno + ano` em `dados_alunos` e `dados_alunos_streaming`, `ano + sigla_uf + rede` em `meta_alfabetizacao_uf`).
 - **Valores Nulos**: Garante a ausência de nulos em chaves primárias e colunas de agregação obrigatórias.
-- **Integridade Referencial**: confirma que as tabelas Silver (`dados_alunos_streaming`, `avaliacao_alfabetizacao_municipio`, `meta_alfabetizacao_municipio`) não têm `id_municipio` fora de `dim_localidades` — hoje isso é garantido por construção (`INNER JOIN` no `transform_silver.py`), então essas checagens funcionam como teste de regressão.
+- **Integridade Referencial**: confirma que as tabelas Silver (`dados_alunos`, `dados_alunos_streaming`, `avaliacao_alfabetizacao_municipio`, `meta_alfabetizacao_municipio`) não têm `id_municipio` fora de `dim_localidades` — hoje isso é garantido por construção (`INNER JOIN` no `transform_silver.py`), então essas checagens funcionam como teste de regressão.
 - **Quarentena, não mascaramento**: registros que não casam com `dim_localidades` não entram na tabela Silver com um valor "curinga" — vão para `silver.quarentena_*` com o motivo da rejeição. O volume de cada tabela de quarentena é reportado como aviso (não trava o pipeline), para dar visibilidade sem impedir que o restante dos dados bons siga adiante.
 - **Sanidade de Domínio**: Confirma que campos como `presenca` e `alfabetizado` contêm estritamente `0` ou `1`.
+- **Cobertura dos microdados (Gold)**: verifica que o comparativo municipal está apoiado na carga batch completa — se a ingestão dos 3,87M microdados falhar, o check acusa em vez de o mart passar silenciosamente com agregados vazios.
+
+### Histórico de qualidade — resultados persistidos, não só logados
+
+Antes, o resultado de cada check vivia apenas no log da execução: dava para ver se a rodada passou, mas não dava para responder *"quantas vezes esse check falhou no último mês?"* nem plotar a evolução da qualidade.
+
+Agora cada execução grava uma linha por check em **`quality.data_quality_results`** — particionada por dia (`executed_at`) e clusterizada por `layer`/`check_name`:
+
+| Coluna | Descrição |
+|---|---|
+| `run_id` | UUID que amarra todos os checks da mesma rodada |
+| `executed_at` | Timestamp da execução (chave de partição) |
+| `layer` | `silver` ou `gold` |
+| `check_name` | Nome do teste |
+| `failed_count` | Registros que violaram a regra |
+| `status` | `PASS`, `WARN` (falhou mas não é crítico) ou `FAIL` |
+| `critical` | Se a falha interrompe o pipeline |
+
+A gravação acontece num bloco `finally`, então **mesmo quando um check crítico aborta o pipeline o histórico daquela rodada é registrado** — que é justamente o caso que mais interessa auditar depois. Exemplo de pergunta agora respondível:
+
+```sql
+-- Evolução de um check nos últimos 30 dias
+SELECT DATE(executed_at) AS dia, status, failed_count
+FROM `tech-challenge-alfabetiza-25.quality.data_quality_results`
+WHERE check_name = 'dados_alunos - unicidade de id_aluno por ano'
+  AND executed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+ORDER BY dia DESC;
+```
 
 ## Monitoramento e FinOps
 

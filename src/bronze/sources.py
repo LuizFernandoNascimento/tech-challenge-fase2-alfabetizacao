@@ -64,8 +64,23 @@ BD_BATCH_SOURCES = [
     BasedosdadosSource("municipio", "avaliacao_alfabetizacao_municipio"),
 ]
 
-# Microdados de aluno: granularidade de evento, usados na simulação de
-# streaming - também lidos direto da tabela pública `alunos`.
+# Microdados de aluno via BATCH - a carga completa e autoritativa.
+#
+# Esta é a entidade "Dados de alunos" exigida pelo enunciado, ingerida
+# de verdade: ~3,87 milhões de linhas. Ela NÃO cabe no mesmo caminho
+# das fontes acima (que trazem as linhas para o processo Python), então
+# tem um fluxo próprio - CTAS server-side em US + cópia cross-region -
+# implementado em batch_ingest.py::load_large_table_from_basedosdados.
+BD_LARGE_BATCH_SOURCES = [
+    BasedosdadosSource("alunos", "dados_alunos"),
+]
+
+# Microdados de aluno via STREAMING: a MESMA fonte, replayada evento a
+# evento no Pub/Sub para exercitar o caminho quase em tempo real da
+# arquitetura híbrida. É uma amostra por natureza (o produtor controla
+# quantos eventos publica) e serve para medir frescor/latência de
+# ingestão - NÃO para calcular o indicador de alfabetização, que sai da
+# carga batch completa acima. Ver a distinção explicitada na Gold.
 STREAMING_SOURCE = BasedosdadosSource("alunos", "dados_alunos_streaming")
 
 # Dimensão de referência (UF/Município), buscada da API do IBGE - ver
