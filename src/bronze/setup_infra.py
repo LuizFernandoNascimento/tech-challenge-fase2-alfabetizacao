@@ -63,8 +63,18 @@ def run() -> None:
     bq_client = bigquery.Client(project=settings.project_id)
 
     ensure_bucket(storage_client, settings.bucket_raw, settings.region)
-    for dataset_id in (settings.dataset_bronze, settings.dataset_silver, settings.dataset_gold):
+    for dataset_id in (
+        settings.dataset_bronze,
+        settings.dataset_silver,
+        settings.dataset_gold,
+        settings.dataset_quality,
+    ):
         ensure_dataset(bq_client, dataset_id, settings.region)
+
+    # Staging na multi-região US: precisa ficar em US porque é lá que
+    # vive a fonte pública da Base dos Dados, e o BigQuery só aceita
+    # jobs cujas tabelas estejam todas na mesma location.
+    ensure_dataset(bq_client, settings.dataset_bronze_us, "US")
     ensure_topic_and_subscription(
         settings.project_id, settings.pubsub_topic_alunos, settings.pubsub_subscription_alunos
     )
